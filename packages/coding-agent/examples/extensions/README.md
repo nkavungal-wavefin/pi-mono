@@ -39,6 +39,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `truncated-tool.ts` | Wraps ripgrep with proper output truncation (50KB/2000 lines) |
 | `antigravity-image-gen.ts` | Generate images via Google Antigravity with optional save-to-disk modes |
 | `ssh.ts` | Delegate all tools to a remote machine via SSH using pluggable operations |
+| `executor-local.ts` | Register a single `executor` tool backed by a local executor checkout and restrict pi to executor-only mode |
 | `subagent/` | Delegate tasks to specialized subagents with isolated context windows |
 
 ### Commands & UI

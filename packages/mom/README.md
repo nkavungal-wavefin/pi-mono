@@ -1,13 +1,36 @@
 # mom (Master Of Mischief)
 
-A Slack bot powered by an LLM that can execute bash commands, read/write files, and interact with your development environment. Mom is **self-managing**. She installs her own tools, programs [CLI tools (aka "skills")](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/) she can use to help with your workflows and tasks, configures credentials, and maintains her workspace autonomously.
+A Slack bot powered by an LLM that can read/write files, search a workspace, attach files in Slack, and use an executor runtime for external integrations. Mom is **self-managing**. She programs [CLI tools (aka "skills")](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/) she can use to help with your workflows and tasks, configures credentials, and maintains her workspace autonomously.
+
+## Running Mom (PockyClaw)
+
+```bash
+cd /Users/nkavungal/Workspace/pockyclaw/pi-mono/packages/mom
+./docker.sh create ./data
+npm run build
+node dist/main.js --sandbox=docker:mom-sandbox ./data
+```
+
+Before starting mom, make sure these are set in that shell:
+
+```bash
+export MOM_SLACK_APP_TOKEN=...
+export MOM_SLACK_BOT_TOKEN=...
+export MOM_EXECUTOR_ROOT=/Users/nkavungal/Workspace/pockyclaw/executor
+export MOM_EXECUTOR_BASE_URL=http://localhost:8788
+# and either:
+export ANTHROPIC_API_KEY=...
+```
+   # or have ~/.pi/mom/auth.json ready
+
+  At this point, the Docker side is ready for first run
 
 ## Features
 
 - **Minimal by Design**: Turn mom into whatever you need. She builds her own tools without pre-built assumptions
 - **Self-Managing**: Installs tools (apk, npm, etc.), writes scripts, configures credentials. Zero setup from you
 - **Slack Integration**: Responds to @mentions in channels and DMs
-- **Full Bash Access**: Execute any command, read/write files, automate workflows
+- **Workspace Tools + Executor**: Read, write, edit, list, search, attach, and use executor-backed integrations
 - **Docker Sandbox**: Isolate mom in a container (recommended for all use)
 - **Persistent Workspace**: All conversation history, files, and tools stored in one directory you control
 - **Working Memory & Custom Tools**: Mom remembers context across sessions and creates workflow-specific CLI tools ([aka "skills"](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)) for your tasks
@@ -62,21 +85,20 @@ npm install @mariozechner/pi-mom
 # Set environment variables
 export MOM_SLACK_APP_TOKEN=xapp-...
 export MOM_SLACK_BOT_TOKEN=xoxb-...
-# Option 1: Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
-# Option 2: use /login command in pi agent, then copy/link auth.json to ~/.pi/mom/
+# Option 1: use /login in pi coding agent for GitHub Copilot, then link auth.json to ~/.pi/mom/
+# Option 2: or provide a GitHub token via env
+# export COPILOT_GITHUB_TOKEN=ghu_...
 
-# Create Docker sandbox (recommended)
-docker run -d \
-  --name mom-sandbox \
-  -v $(pwd)/data:/workspace \
-  alpine:latest \
-  tail -f /dev/null
+# Build and create Docker sandbox (recommended)
+cd packages/mom
+./docker.sh create ./data
 
 # Run mom in Docker mode
 mom --sandbox=docker:mom-sandbox ./data
 
-# Mom will install any tools she needs herself (git, jq, etc.)
+# Configure executor access if you want external integrations
+# export MOM_EXECUTOR_ROOT=/path/to/executor
+# export MOM_EXECUTOR_BASE_URL=http://localhost:8788
 ```
 
 ## CLI Options
@@ -95,22 +117,25 @@ Options:
 |----------|-------------|
 | `MOM_SLACK_APP_TOKEN` | Slack app-level token (xapp-...) |
 | `MOM_SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) |
-| `ANTHROPIC_API_KEY` | (Optional) Anthropic API key |
+| `MOM_VERBOSE_LOGGING` | Set to `1` to print full provider retry/error details in mom logs |
+| `COPILOT_GITHUB_TOKEN` | (Optional) GitHub Copilot token override |
+| `GH_TOKEN` | (Optional) GitHub token fallback for GitHub Copilot |
+| `GITHUB_TOKEN` | (Optional) GitHub token fallback for GitHub Copilot |
 
 ## Authentication
 
-Mom needs credentials for Anthropic API. The options to set it are:
+Mom now defaults to a GitHub Copilot-backed model. The options to authenticate are:
 
 1. **Environment Variable**
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export COPILOT_GITHUB_TOKEN=ghu_...
 ```
 
-2. **OAuth Login via coding agent command** (Recommended for Claude Pro/Max)
+2. **OAuth Login via coding agent command** (recommended)
 
 - run interactive coding agent session: `npx @mariozechner/pi-coding-agent`
 - enter `/login` command
-  - choose "Anthropic" provider
+  - choose "GitHub Copilot" provider
   - follow instructions in the browser
 - link `auth.json` to mom: `ln -s ~/.pi/agent/auth.json ~/.pi/mom/auth.json`
 
@@ -146,35 +171,34 @@ Everything mom does happens in a workspace you control. This is a single directo
 ### Tools
 
 Mom has access to these tools:
-- **bash**: Execute shell commands. This is her primary tool for getting things done
 - **read**: Read file contents
 - **write**: Create or overwrite files
 - **edit**: Make surgical edits to existing files
+- **ls**: List directory contents
+- **grep**: Search file contents
+- **find**: Search for files by glob pattern
 - **attach**: Share files back to Slack
+- **executor**: Run TypeScript inside the external executor runtime for integrations like Datadog and Atlassian
 
-### Bash Execution Environment
-
-Mom uses the `bash` tool to do most of her work. It can run in one of two environments:
+### Execution Environment
 
 **Docker environment (recommended)**:
-- Commands execute inside an isolated Linux container
+- Local tool operations execute inside an isolated Linux container
 - Mom can only access the mounted data directory from your host, plus anything inside the container
-- She installs tools inside the container and knows apk, apt, yum, etc.
 - Your host system is protected
 
 **Host environment**:
-- Commands execute directly on your machine
-- Mom has full access to your system
+- Local tool operations execute directly on your machine
+- Mom has host-level filesystem access
 - Not recommended. See security section below
 
 ### Self-Managing Environment
 
 Inside her execution environment (Docker container or host), mom has full control:
-- **Installs tools**: `apk add git jq curl` (Linux) or `brew install` (macOS)
 - **Configures tool credentials**: Asks you for tokens/keys and stores them inside the container or data directory, depending on the tool's needs
 - **Persistent**: Everything she installs stays between sessions. If you remove the container, anything not in the data directory is lost
 
-You never need to manually install dependencies. Just ask mom and she'll set it up herself.
+External integrations should go through the **executor** tool rather than direct shell commands.
 
 ### The Data Directory
 
@@ -470,7 +494,7 @@ mom --sandbox=docker:mom-exec ./data-exec
 - `src/store.ts`: Channel data persistence, attachment downloads
 - `src/log.ts`: Centralized logging (console output)
 - `src/sandbox.ts`: Docker/host sandbox execution
-- `src/tools/`: Tool implementations (bash, read, write, edit, attach)
+- `src/tools/`: Tool implementations (read, write, edit, ls, grep, find, attach, executor)
 
 ### Running in Dev Mode
 

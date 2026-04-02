@@ -10,7 +10,7 @@
 #   ./docker.sh shell               - Open a shell in the container
 
 CONTAINER_NAME="mom-sandbox"
-IMAGE="alpine:latest"
+IMAGE="pi-mom-sandbox:latest"
 
 case "$1" in
   create)
@@ -27,6 +27,9 @@ case "$1" in
       exit 1
     fi
     
+    echo "Building image '${IMAGE}'..."
+    docker build -t "$IMAGE" .
+
     echo "Creating container '${CONTAINER_NAME}'..."
     echo "  Data dir: ${DATA_DIR} -> /workspace"
     
@@ -73,6 +76,11 @@ case "$1" in
       echo "Create it with: $0 create <data-dir>"
     fi
     ;;
+
+  build)
+    echo "Building image '${IMAGE}'..."
+    docker build -t "$IMAGE" .
+    ;;
     
   shell)
     echo "Opening shell in '${CONTAINER_NAME}'..."
@@ -85,6 +93,7 @@ case "$1" in
     echo "Usage: $0 <command> [args]"
     echo ""
     echo "Commands:"
+    echo "  build              - Build/update the sandbox image"
     echo "  create <data-dir>  - Create and start the container"
     echo "  start              - Start the container"
     echo "  stop               - Stop the container"  

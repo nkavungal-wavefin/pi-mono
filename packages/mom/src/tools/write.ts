@@ -1,6 +1,7 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 import type { Executor } from "../sandbox.js";
+import { shellEscape } from "./shell.js";
 
 const writeSchema = Type.Object({
 	label: Type.String({ description: "Brief description of what you're writing (shown to user)" }),
@@ -38,8 +39,4 @@ export function createWriteTool(executor: Executor): AgentTool<typeof writeSchem
 			};
 		},
 	};
-}
-
-function shellEscape(s: string): string {
-	return `'${s.replace(/'/g, "'\\''")}'`;
 }

@@ -1,5 +1,5 @@
 import { SocketModeClient } from "@slack/socket-mode";
-import { WebClient } from "@slack/web-api";
+import { ErrorCode, type WebAPIPlatformError, WebClient } from "@slack/web-api";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
 import * as log from "./log.js";
@@ -560,64 +560,96 @@ export class SlackBot {
 	// ==========================================================================
 
 	private async fetchUsers(): Promise<void> {
-		let cursor: string | undefined;
-		do {
-			const result = await this.webClient.users.list({ limit: 200, cursor });
-			const members = result.members as
-				| Array<{ id?: string; name?: string; real_name?: string; deleted?: boolean }>
-				| undefined;
-			if (members) {
-				for (const u of members) {
-					if (u.id && u.name && !u.deleted) {
-						this.users.set(u.id, { id: u.id, userName: u.name, displayName: u.real_name || u.name });
+		try {
+			let cursor: string | undefined;
+			do {
+				const result = await this.webClient.users.list({ limit: 200, cursor });
+				const members = result.members as
+					| Array<{ id?: string; name?: string; real_name?: string; deleted?: boolean }>
+					| undefined;
+				if (members) {
+					for (const u of members) {
+						if (u.id && u.name && !u.deleted) {
+							this.users.set(u.id, { id: u.id, userName: u.name, displayName: u.real_name || u.name });
+						}
 					}
 				}
+				cursor = result.response_metadata?.next_cursor;
+			} while (cursor);
+		} catch (error) {
+			if (isMissingScopeError(error)) {
+				log.logWarning("Skipping Slack user lookup due to missing scope", "Add users:read to enable user names.");
+				return;
 			}
-			cursor = result.response_metadata?.next_cursor;
-		} while (cursor);
+			throw error;
+		}
 	}
 
 	private async fetchChannels(): Promise<void> {
-		// Fetch public/private channels
-		let cursor: string | undefined;
-		do {
-			const result = await this.webClient.conversations.list({
-				types: "public_channel,private_channel",
-				exclude_archived: true,
-				limit: 200,
-				cursor,
-			});
-			const channels = result.channels as Array<{ id?: string; name?: string; is_member?: boolean }> | undefined;
-			if (channels) {
-				for (const c of channels) {
-					if (c.id && c.name && c.is_member) {
-						this.channels.set(c.id, { id: c.id, name: c.name });
+		try {
+			// Fetch public/private channels
+			let cursor: string | undefined;
+			do {
+				const result = await this.webClient.conversations.list({
+					types: "public_channel,private_channel",
+					exclude_archived: true,
+					limit: 200,
+					cursor,
+				});
+				const channels = result.channels as Array<{ id?: string; name?: string; is_member?: boolean }> | undefined;
+				if (channels) {
+					for (const c of channels) {
+						if (c.id && c.name && c.is_member) {
+							this.channels.set(c.id, { id: c.id, name: c.name });
+						}
 					}
 				}
-			}
-			cursor = result.response_metadata?.next_cursor;
-		} while (cursor);
+				cursor = result.response_metadata?.next_cursor;
+			} while (cursor);
 
-		// Also fetch DM channels (IMs)
-		cursor = undefined;
-		do {
-			const result = await this.webClient.conversations.list({
-				types: "im",
-				limit: 200,
-				cursor,
-			});
-			const ims = result.channels as Array<{ id?: string; user?: string }> | undefined;
-			if (ims) {
-				for (const im of ims) {
-					if (im.id) {
-						// Use user's name as channel name for DMs
-						const user = im.user ? this.users.get(im.user) : undefined;
-						const name = user ? `DM:${user.userName}` : `DM:${im.id}`;
-						this.channels.set(im.id, { id: im.id, name });
+			// Also fetch DM channels (IMs)
+			cursor = undefined;
+			do {
+				const result = await this.webClient.conversations.list({
+					types: "im",
+					limit: 200,
+					cursor,
+				});
+				const ims = result.channels as Array<{ id?: string; user?: string }> | undefined;
+				if (ims) {
+					for (const im of ims) {
+						if (im.id) {
+							const user = im.user ? this.users.get(im.user) : undefined;
+							const name = user ? `DM:${user.userName}` : `DM:${im.id}`;
+							this.channels.set(im.id, { id: im.id, name });
+						}
 					}
 				}
+				cursor = result.response_metadata?.next_cursor;
+			} while (cursor);
+		} catch (error) {
+			if (isMissingScopeError(error)) {
+				log.logWarning(
+					"Skipping Slack channel lookup due to missing scope",
+					"Add channels:read, groups:read, and im:read to enable channel and DM names plus startup backfill.",
+				);
+				return;
 			}
-			cursor = result.response_metadata?.next_cursor;
-		} while (cursor);
+			throw error;
+		}
 	}
+}
+
+function isMissingScopeError(error: unknown): error is WebAPIPlatformError {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		error.code === ErrorCode.PlatformError &&
+		"data" in error &&
+		typeof error.data === "object" &&
+		error.data !== null &&
+		"error" in error.data &&
+		error.data.error === "missing_scope"
+	);
 }

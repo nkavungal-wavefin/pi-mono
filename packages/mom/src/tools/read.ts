@@ -3,6 +3,7 @@ import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { extname } from "path";
 import type { Executor } from "../sandbox.js";
+import { shellEscape } from "./shell.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.js";
 
 /**
@@ -114,7 +115,7 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 			if (truncation.firstLineExceedsLimit) {
 				// First line at offset exceeds 50KB - tell model to use bash
 				const firstLineSize = formatSize(Buffer.byteLength(selectedContent.split("\n")[0], "utf-8"));
-				outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+				outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use offset/limit to continue or narrow the read.]`;
 				details = { truncation };
 			} else if (truncation.truncated) {
 				// Truncation occurred - build actionable notice
@@ -152,8 +153,4 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 			};
 		},
 	};
-}
-
-function shellEscape(s: string): string {
-	return `'${s.replace(/'/g, "'\\''")}'`;
 }

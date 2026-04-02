@@ -14,8 +14,10 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/main.js",
+		"build:deps": "npm --prefix ../tui run build && npm --prefix ../ai run build && npm --prefix ../agent run build && npm --prefix ../coding-agent run build",
+		"build": "npm run build:deps && tsgo -p tsconfig.build.json && shx chmod +x dist/main.js",
 		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+		"test": "node --import tsx --test test/**/*.test.ts",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {

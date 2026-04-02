@@ -63,16 +63,17 @@ Use the provided script:
 Or manually:
 
 ```bash
+docker build -t pi-mom-sandbox:latest .
 docker run -d --name mom-sandbox \
   -v /path/to/mom-data:/workspace \
-  alpine:latest tail -f /dev/null
+  pi-mom-sandbox:latest tail -f /dev/null
 ```
 
 ## Mom Manages Her Own Computer
 
 The container is treated as mom's personal computer. She can:
 
-- Install tools: `apk add github-cli git curl`
+- Use helper tools already present in the image: `fd`, `rg`, `git`, `gh`, `jq`, `curl`
 - Configure credentials: `gh auth login`
 - Create files and directories
 - Persist state across restarts

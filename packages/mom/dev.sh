@@ -2,6 +2,7 @@
 set -e
 
 CONTAINER_NAME="mom-sandbox"
+IMAGE="pi-mom-sandbox:latest"
 DATA_DIR="$(pwd)/data"
 
 # Create data directory if it doesn't exist
@@ -17,11 +18,13 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         echo "Container $CONTAINER_NAME already running"
     fi
 else
+    echo "Building image: $IMAGE"
+    docker build -t "$IMAGE" .
     echo "Creating container: $CONTAINER_NAME"
     docker run -d \
         --name "$CONTAINER_NAME" \
         -v "$DATA_DIR:/workspace" \
-        alpine:latest \
+        "$IMAGE" \
         tail -f /dev/null
 fi
 

@@ -1,5 +1,5 @@
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import { getModel, type ImageContent } from "@mariozechner/pi-ai";
+import { getModel, type ImageContent, streamSimple } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -24,7 +24,8 @@ import type { ChannelStore } from "./store.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-sonnet-4-5");
+const model = getModel("github-copilot", "gpt-5.4");
+const MOM_VERBOSE_LOGGING = process.env.MOM_VERBOSE_LOGGING === "1";
 
 export interface PendingMessage {
 	userName: string;
@@ -40,18 +41,6 @@ export interface AgentRunner {
 		pendingMessages?: PendingMessage[],
 	): Promise<{ stopReason: string; errorMessage?: string }>;
 	abort(): void;
-}
-
-async function getAnthropicApiKey(authStorage: AuthStorage): Promise<string> {
-	const key = await authStorage.getApiKey("anthropic");
-	if (!key) {
-		throw new Error(
-			"No API key found for anthropic.\n\n" +
-				"Set an API key environment variable, or use /login with Anthropic and link to auth.json from " +
-				join(homedir(), ".pi", "mom", "auth.json"),
-		);
-	}
-	return key;
 }
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
@@ -138,7 +127,7 @@ function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	return Array.from(skillMap.values());
 }
 
-function buildSystemPrompt(
+export function buildSystemPrompt(
 	workspacePath: string,
 	channelId: string,
 	memory: string,
@@ -160,17 +149,15 @@ function buildSystemPrompt(
 
 	const envDescription = isDocker
 		? `You are running inside a Docker container (Alpine Linux).
-- Bash working directory: / (use cd or absolute paths)
-- Install tools with: apk add <package>
+- Filesystem operations run inside the container
 - Your changes persist across sessions`
 		: `You are running directly on the host machine.
-- Bash working directory: ${process.cwd()}
+- Filesystem operations run directly on the host machine
 - Be careful with system modifications`;
 
 	return `You are mom, a Slack bot assistant. Be concise. No emojis.
 
 ## Context
-- For current date/time, use: date
 - You have access to previous conversation context including tool results from prior turns.
 - For older history beyond your context, search log.jsonl (contains user messages and your final responses, but not tool results).
 
@@ -255,17 +242,16 @@ All \`at\` timestamps must include offset (e.g., \`+01:00\`). Periodic events us
 
 ### Creating Events
 Use unique filenames to avoid overwriting existing events. Include a timestamp or random suffix:
-\`\`\`bash
-cat > ${workspacePath}/events/dentist-reminder-$(date +%s).json << 'EOF'
+\`\`\`json
+${workspacePath}/events/dentist-reminder-1730000000.json
 {"type": "one-shot", "channelId": "${channelId}", "text": "Dentist tomorrow", "at": "2025-12-14T09:00:00+01:00"}
-EOF
 \`\`\`
-Or check if file exists first before creating.
+Write the JSON file with the write tool. Or check if file exists first before creating.
 
 ### Managing Events
-- List: \`ls ${workspacePath}/events/\`
-- View: \`cat ${workspacePath}/events/foo.json\`
-- Delete/cancel: \`rm ${workspacePath}/events/foo.json\`
+- List: use \`ls\` on \`${workspacePath}/events/\`
+- View: use \`read\` on \`${workspacePath}/events/foo.json\`
+- Delete/cancel: overwrite or remove the file through your available file tools
 
 ### When Events Trigger
 You receive a message like:
@@ -294,7 +280,7 @@ ${memory}
 
 ## System Configuration Log
 Maintain ${workspacePath}/SYSTEM.md to log all environment modifications:
-- Installed packages (apk add, npm install, pip install)
+- Installed packages or services used by your workflows
 - Environment variables set
 - Config files modified (~/.gitconfig, cron jobs, etc.)
 - Skill dependencies installed
@@ -304,25 +290,26 @@ Update this file whenever you modify the environment. On fresh container, read i
 ## Log Queries (for older history)
 Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
 The log contains user messages and your final responses (not tool calls/results).
-${isDocker ? "Install jq: apk add jq" : ""}
-
-\`\`\`bash
-# Recent messages
-tail -30 log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
-
-# Search for specific topic
-grep -i "topic" log.jsonl | jq -c '{date: .date[0:19], user: (.userName // .user), text}'
-
-# Messages from specific user
-grep '"userName":"mario"' log.jsonl | tail -20 | jq -c '{date: .date[0:19], text}'
-\`\`\`
+Use read for targeted inspection and grep for search.
 
 ## Tools
-- bash: Run shell commands (primary tool). Install packages as needed.
 - read: Read files
 - write: Create/overwrite files
 - edit: Surgical file edits
+- ls: List directory contents
+- grep: Search file contents
+- find: Search for files by glob pattern
 - attach: Share files to Slack
+- executor: Use this for external integrations and executor runtime capabilities
+
+Rules:
+- \`bash\` is not available.
+- Use \`read\`, \`write\`, \`edit\`, \`ls\`, \`grep\`, and \`find\` for local workspace tasks.
+- Use \`attach\` to share files back to Slack.
+- Use \`executor\` for external integrations such as Datadog, Atlassian, and other runtime capabilities outside simple local file work.
+- The \`executor\` tool runs TypeScript inside executor's runtime, not Node.js, not shell, and not mom's host process.
+- Discover executor capabilities by intent with \`tools.discover(...)\` inside executor call code when needed.
+- If executor returns a paused execution, treat that as an error for this milestone. Do not attempt to resume it.
 
 Each tool requires a "label" parameter (shown to user).
 `;
@@ -430,17 +417,29 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	// Auth stored outside workspace so agent can't access it
 	const authStorage = AuthStorage.create(join(homedir(), ".pi", "mom", "auth.json"));
 	const modelRegistry = ModelRegistry.create(authStorage);
+	const resolvedModel = modelRegistry.find(model.provider, model.id) ?? model;
 
 	// Create agent
 	const agent = new Agent({
 		initialState: {
 			systemPrompt,
-			model,
+			model: resolvedModel,
 			thinkingLevel: "off",
 			tools,
 		},
 		convertToLlm,
-		getApiKey: async () => getAnthropicApiKey(authStorage),
+		streamFn: async (requestModel, context, options) => {
+			const auth = await modelRegistry.getApiKeyAndHeaders(requestModel);
+			if (!auth.ok) {
+				throw new Error(auth.error);
+			}
+			return streamSimple(requestModel, context, {
+				...options,
+				apiKey: auth.apiKey,
+				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
+			});
+		},
+		sessionId: sessionManager.getSessionId(),
 	});
 
 	// Load existing messages
@@ -591,13 +590,11 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
 					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
-					queue.enqueueMessage(`_${thinking}_`, "thread", "thinking thread", false);
 				}
 
 				if (text.trim()) {
 					log.logResponse(logCtx, text);
 					queue.enqueueMessage(text, "main", "response main");
-					queue.enqueueMessage(text, "thread", "response thread", false);
 				}
 			}
 		} else if (event.type === "compaction_start") {
@@ -612,6 +609,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		} else if (event.type === "auto_retry_start") {
 			const retryEvent = event as any;
 			log.logWarning(`Retrying (${retryEvent.attempt}/${retryEvent.maxAttempts})`, retryEvent.errorMessage);
+			if (MOM_VERBOSE_LOGGING && retryEvent.errorMessage) {
+				log.logWarning("Verbose retry error details", retryEvent.errorMessage);
+			}
 			queue.enqueue(
 				() => ctx.respond(`_Retrying (${retryEvent.attempt}/${retryEvent.maxAttempts})..._`, false),
 				"retry",
@@ -784,6 +784,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			// Handle error case - update main message and post error to thread
 			if (runState.stopReason === "error" && runState.errorMessage) {
+				if (MOM_VERBOSE_LOGGING) {
+					log.logAgentError(runState.logCtx ?? "system", runState.errorMessage);
+				}
 				try {
 					await ctx.replaceMessage("_Sorry, something went wrong_");
 					await ctx.respondInThread(`_Error: ${runState.errorMessage}_`);
