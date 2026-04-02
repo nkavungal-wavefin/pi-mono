@@ -2,12 +2,21 @@
 
 import { join, resolve } from "path";
 import { type AgentRunner, getOrCreateRunner } from "./agent.js";
+import { continueResolvedApproval, resolveApprovalAction } from "./approval-actions.js";
+import { loadApproval, type PendingApproval, updateApproval } from "./approvals.js";
 import { downloadChannel } from "./download.js";
 import { createEventsWatcher } from "./events.js";
 import * as log from "./log.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
-import { type MomHandler, type SlackBot, SlackBot as SlackBotClass, type SlackEvent } from "./slack.js";
+import {
+	type ApprovalAction,
+	type MomHandler,
+	type SlackBot,
+	SlackBot as SlackBotClass,
+	type SlackEvent,
+} from "./slack.js";
 import { ChannelStore } from "./store.js";
+import { resumeExecutorExecution } from "./tools/executor.js";
 
 // ============================================================================
 // Config
@@ -88,11 +97,12 @@ interface ChannelState {
 	store: ChannelStore;
 	stopRequested: boolean;
 	stopMessageTs?: string;
+	approvalCallbackWired: boolean;
 }
 
 const channelStates = new Map<string, ChannelState>();
 
-function getState(channelId: string): ChannelState {
+function getState(channelId: string, slack?: SlackBot): ChannelState {
 	let state = channelStates.get(channelId);
 	if (!state) {
 		const channelDir = join(workingDir, channelId);
@@ -101,8 +111,27 @@ function getState(channelId: string): ChannelState {
 			runner: getOrCreateRunner(sandbox, channelId, channelDir),
 			store: new ChannelStore({ workingDir, botToken: MOM_SLACK_BOT_TOKEN! }),
 			stopRequested: false,
+			approvalCallbackWired: false,
 		};
 		channelStates.set(channelId, state);
+	}
+	// Wire approval callback once we have a slack reference
+	if (slack && !state.approvalCallbackWired) {
+		state.runner.setApprovalCallback(async (approval: PendingApproval) => {
+			try {
+				const ts = await slack.postApprovalWidget(
+					approval.channelId,
+					approval.toolCallId,
+					approval.label,
+					approval.instruction,
+				);
+				approval.approvalMessageTs = ts;
+				updateApproval(workingDir, approval);
+			} catch (err) {
+				log.logWarning("Failed to post approval widget", err instanceof Error ? err.message : String(err));
+			}
+		});
+		state.approvalCallbackWired = true;
 	}
 	return state;
 }
@@ -297,7 +326,7 @@ const handler: MomHandler = {
 	},
 
 	async handleEvent(event: SlackEvent, slack: SlackBot, isEvent?: boolean): Promise<void> {
-		const state = getState(event.channel);
+		const state = getState(event.channel, slack);
 
 		// Start run
 		state.running = true;
@@ -323,8 +352,94 @@ const handler: MomHandler = {
 					await slack.postMessage(event.channel, "_Stopped_");
 				}
 			}
+			// If aborted due to a pending approval, don't post "Stopped"
+			// The approval widget is already posted by the event subscriber
 		} catch (err) {
 			log.logWarning(`[${event.channel}] Run error`, err instanceof Error ? err.message : String(err));
+		} finally {
+			state.running = false;
+		}
+	},
+
+	async handleApprovalAction(action: ApprovalAction, slack: SlackBot): Promise<void> {
+		const { actionId, toolCallId, channelId, userId, messageTs } = action;
+		const approved = actionId === "mom_approve";
+
+		log.logInfo(`[${channelId}] Approval ${approved ? "approved" : "rejected"} by ${userId} for ${toolCallId}`);
+
+		// Load the pending approval
+		const approval = loadApproval(workingDir, channelId, toolCallId);
+		if (!approval) {
+			log.logWarning(`[${channelId}] No pending approval found for ${toolCallId}`);
+			return;
+		}
+		if (approval.status !== "pending") {
+			log.logWarning(`[${channelId}] Approval ${toolCallId} already resolved: ${approval.status}`);
+			return;
+		}
+
+		// Update approval widget in Slack
+		if (messageTs) {
+			try {
+				await slack.updateApprovalWidget(channelId, messageTs, approval.label, approved, userId);
+			} catch (err) {
+				log.logWarning("Failed to update approval widget", err instanceof Error ? err.message : String(err));
+			}
+		}
+
+		const resolution = await resolveApprovalAction(
+			workingDir,
+			channelId,
+			toolCallId,
+			userId,
+			approved,
+			(pendingApproval) =>
+				resumeExecutorExecution({
+					executionId: pendingApproval.executorExecutionId,
+					baseUrl: pendingApproval.baseUrl,
+					noOpen: true,
+					input: { approve: approved },
+				}),
+		);
+		if (!resolution) {
+			log.logWarning(`[${channelId}] Approval ${toolCallId} could not be resolved`);
+			return;
+		}
+		// Continue the conversation in the same channel
+		const state = getState(channelId, slack);
+		if (state.running) {
+			log.logWarning(`[${channelId}] Channel busy, cannot continue after approval`);
+			await slack.postMessage(
+				channelId,
+				`_Approval resolved but channel is busy. Result will be picked up next run._`,
+			);
+			return;
+		}
+
+		state.running = true;
+		try {
+			const ctx = createSlackContext(
+				{
+					type: "mention",
+					channel: channelId,
+					ts: String(Date.now() / 1000),
+					user: userId,
+					text: approved
+						? `Approval granted for "${approval.label}"; resuming executor.`
+						: `Approval rejected for "${approval.label}".`,
+				},
+				slack,
+				state,
+			);
+
+			await ctx.setTyping(true);
+			await ctx.setWorking(true);
+			const result = await continueResolvedApproval(state.runner, ctx as any, state.store, resolution);
+			await ctx.setWorking(false);
+
+			log.logInfo(`[${channelId}] Continuation after approval completed: ${result.stopReason}`);
+		} catch (err) {
+			log.logWarning(`[${channelId}] Continuation error`, err instanceof Error ? err.message : String(err));
 		} finally {
 			state.running = false;
 		}

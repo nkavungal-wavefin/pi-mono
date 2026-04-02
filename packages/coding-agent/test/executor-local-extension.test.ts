@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Agent } from "@mariozechner/pi-agent-core";
 import { getModel } from "@mariozechner/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import executorLocalExtension from "../examples/extensions/executor-local.ts";
+import executorLocalExtension from "../examples/extensions/executor-local.js";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createEventBus } from "../src/core/event-bus.js";
@@ -108,15 +108,20 @@ async function createSessionWithExtension(
 		},
 	});
 
+	const injectedResourceLoader = new DefaultResourceLoader({
+		cwd: tempDir,
+		agentDir,
+		settingsManager,
+		extensionsOverride: () => ({ extensions: [extension], errors: [], runtime }),
+	});
+	await injectedResourceLoader.reload();
+
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
 		cwd: tempDir,
-		resourceLoader: {
-			...resourceLoader,
-			getExtensions: () => ({ extensions: [extension], errors: [], runtime }),
-		},
+		resourceLoader: injectedResourceLoader,
 		modelRegistry,
 	});
 
@@ -153,14 +158,13 @@ describe("executor-local extension", () => {
 		}
 	});
 
-	it("registers executor and restricts active tools to it", async () => {
+	it("registers the locked-down executor tool set", async () => {
 		const fakeRepo = createFakeExecutorRepo("success");
 		const { session, cleanup } = await createSessionWithExtension(tempDir, { root: fakeRepo });
 		try {
-			expect(session.getAllTools().map((tool) => tool.name)).toContain("executor");
-			expect(session.getActiveToolNames()).toEqual(["executor"]);
-			expect(session.systemPrompt).toContain("- executor: Run TypeScript against the local executor runtime");
-			expect(session.systemPrompt).not.toContain("- read:");
+			expect(session.getActiveToolNames()).toEqual(["read", "edit", "write", "grep", "find", "ls", "executor"]);
+			expect(session.systemPrompt).toContain("- executor: Run TypeScript in the local executor runtime");
+			expect(session.systemPrompt).toContain("- read:");
 			expect(session.systemPrompt).not.toContain("- bash:");
 		} finally {
 			cleanup();

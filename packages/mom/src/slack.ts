@@ -1,4 +1,5 @@
 import { SocketModeClient } from "@slack/socket-mode";
+import type { KnownBlock } from "@slack/types";
 import { ErrorCode, type WebAPIPlatformError, WebClient } from "@slack/web-api";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
@@ -83,6 +84,84 @@ export interface MomHandler {
 	 * Called when user says "stop" while mom is running
 	 */
 	handleStop(channelId: string, slack: SlackBot): Promise<void>;
+
+	/**
+	 * Handle an approval action from Slack interactive message (ASYNC)
+	 */
+	handleApprovalAction?(action: ApprovalAction, slack: SlackBot): Promise<void>;
+}
+
+/** Parsed approval action from a Slack block_actions interaction */
+export interface ApprovalAction {
+	actionId: "mom_approve" | "mom_reject";
+	toolCallId: string;
+	channelId: string;
+	userId: string;
+	messageTs: string;
+}
+
+export function buildApprovalWidgetBlocks(
+	channelId: string,
+	toolCallId: string,
+	label: string,
+	instruction?: string,
+): KnownBlock[] {
+	const blocks: KnownBlock[] = [
+		{
+			type: "section",
+			text: {
+				type: "mrkdwn",
+				text: `*Approval required:* ${label}`,
+			},
+		},
+		{
+			type: "actions",
+			elements: [
+				{
+					type: "button",
+					text: { type: "plain_text", text: "Approve", emoji: true },
+					style: "primary",
+					action_id: "mom_approve",
+					value: JSON.stringify({ toolCallId, channelId }),
+				},
+				{
+					type: "button",
+					text: { type: "plain_text", text: "Reject", emoji: true },
+					style: "danger",
+					action_id: "mom_reject",
+					value: JSON.stringify({ toolCallId, channelId }),
+				},
+			],
+		},
+	];
+	if (instruction) {
+		blocks.splice(1, 0, {
+			type: "context",
+			elements: [{ type: "mrkdwn", text: instruction }],
+		});
+	}
+	return blocks;
+}
+
+export function buildResolvedApprovalMessage(
+	label: string,
+	approved: boolean,
+	resolvedBy?: string,
+): { text: string; blocks: KnownBlock[] } {
+	const status = approved ? "✅ Approved" : "❌ Rejected";
+	const byText = resolvedBy ? ` by <@${resolvedBy}>` : "";
+	return {
+		text: `${status}: ${label}${byText}`,
+		blocks: [
+			{
+				type: "section",
+				text: {
+					type: "mrkdwn",
+					text: `${status}: *${label}*${byText}`,
+				},
+			},
+		],
+	};
 }
 
 // ============================================================================
@@ -214,6 +293,40 @@ export class SlackBot {
 	}
 
 	/**
+	 * Post a Block Kit approval widget with approve/reject buttons.
+	 * Returns the message ts.
+	 */
+	async postApprovalWidget(channel: string, toolCallId: string, label: string, instruction?: string): Promise<string> {
+		const blocks = buildApprovalWidgetBlocks(channel, toolCallId, label, instruction);
+
+		const result = await this.webClient.chat.postMessage({
+			channel,
+			text: `Approval required: ${label}`,
+			blocks,
+		});
+		return result.ts as string;
+	}
+
+	/**
+	 * Update an approval widget to show resolved state.
+	 */
+	async updateApprovalWidget(
+		channel: string,
+		messageTs: string,
+		label: string,
+		approved: boolean,
+		resolvedBy?: string,
+	): Promise<void> {
+		const resolved = buildResolvedApprovalMessage(label, approved, resolvedBy);
+		await this.webClient.chat.update({
+			channel,
+			ts: messageTs,
+			text: resolved.text,
+			blocks: resolved.blocks,
+		});
+	}
+
+	/**
 	 * Log a message to log.jsonl (SYNC)
 	 * This is the ONLY place messages are written to log.jsonl
 	 */
@@ -270,6 +383,50 @@ export class SlackBot {
 	}
 
 	private setupEventHandlers(): void {
+		// Interactive messages (approval buttons)
+		this.socketClient.on("interactive", ({ ack, body }: { ack: () => void; body: Record<string, unknown> }) => {
+			ack();
+
+			if (body.type !== "block_actions") return;
+
+			const actions = body.actions as
+				| Array<{
+						action_id: string;
+						value?: string;
+				  }>
+				| undefined;
+			if (!actions || actions.length === 0) return;
+
+			const action = actions[0];
+			if (action.action_id !== "mom_approve" && action.action_id !== "mom_reject") return;
+
+			let parsed: { toolCallId: string; channelId: string };
+			try {
+				parsed = JSON.parse(action.value || "{}");
+			} catch {
+				log.logWarning("Failed to parse approval action value", action.value || "");
+				return;
+			}
+
+			const userId = (body.user as { id?: string })?.id || "unknown";
+			const messageTs = (body.message as { ts?: string })?.ts || "";
+			const channel = (body.channel as { id?: string })?.id || parsed.channelId;
+
+			const approvalAction: ApprovalAction = {
+				actionId: action.action_id as "mom_approve" | "mom_reject",
+				toolCallId: parsed.toolCallId,
+				channelId: channel,
+				userId,
+				messageTs,
+			};
+
+			if (this.handler.handleApprovalAction) {
+				this.handler.handleApprovalAction(approvalAction, this).catch((err) => {
+					log.logWarning("Approval action error", err instanceof Error ? err.message : String(err));
+				});
+			}
+		});
+
 		// Channel @mentions
 		this.socketClient.on("app_mention", ({ event, ack }) => {
 			const e = event as {

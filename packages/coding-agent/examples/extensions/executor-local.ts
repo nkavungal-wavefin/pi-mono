@@ -42,6 +42,7 @@ import {
 	type TruncationResult,
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
+import type { TSchema } from "@sinclair/typebox";
 import { Type } from "@sinclair/typebox";
 
 const DEFAULT_EXECUTOR_ROOT = "/Users/nkavungal/Workspace/pockyclaw/executor";
@@ -116,10 +117,10 @@ function rewriteReadResultText(text: string): string {
 	);
 }
 
-function wrapPathLockedToolDefinition(
-	definition: ToolDefinition,
+function wrapPathLockedToolDefinition<TParams extends TSchema, TDetails, TState>(
+	definition: ToolDefinition<TParams, TDetails, TState>,
 	options?: { rewriteReadHints?: boolean },
-): ToolDefinition {
+): ToolDefinition<TParams, TDetails, TState> {
 	return {
 		...definition,
 		promptGuidelines: [...(definition.promptGuidelines ?? []), PATH_LOCKED_GUIDELINE],
@@ -146,14 +147,14 @@ function wrapPathLockedToolDefinition(
 	};
 }
 
-function createLockedFsToolDefinitions(cwd: string): ToolDefinition[] {
+function createLockedFsToolDefinitions(cwd: string) {
 	const read = wrapPathLockedToolDefinition(createReadToolDefinition(cwd), { rewriteReadHints: true });
 	const edit = wrapPathLockedToolDefinition(createEditToolDefinition(cwd));
 	const write = wrapPathLockedToolDefinition(createWriteToolDefinition(cwd));
 	const grep = wrapPathLockedToolDefinition(createGrepToolDefinition(cwd));
 	const find = wrapPathLockedToolDefinition(createFindToolDefinition(cwd));
 	const ls = wrapPathLockedToolDefinition(createLsToolDefinition(cwd));
-	return [read, edit, write, grep, find, ls];
+	return [read, edit, write, grep, find, ls] as const;
 }
 
 const executorSchema = Type.Object({
@@ -415,9 +416,13 @@ function rewriteExecutorOnlySystemPrompt(systemPrompt: string): string {
 }
 
 export default function executorLocalExtension(pi: ExtensionAPI): void {
-	for (const tool of createLockedFsToolDefinitions(SESSION_CWD)) {
-		pi.registerTool(tool);
-	}
+	const fsTools = createLockedFsToolDefinitions(SESSION_CWD);
+	pi.registerTool(fsTools[0]);
+	pi.registerTool(fsTools[1]);
+	pi.registerTool(fsTools[2]);
+	pi.registerTool(fsTools[3]);
+	pi.registerTool(fsTools[4]);
+	pi.registerTool(fsTools[5]);
 
 	pi.registerFlag("executor-root", {
 		description: "Path to the local executor checkout",
@@ -468,23 +473,11 @@ export default function executorLocalExtension(pi: ExtensionAPI): void {
 			const commandOverride = pi.getFlag("executor-command") as string | undefined;
 			const cli = getExecutorCommand(root, commandOverride);
 
+			const noOpenFlag = "noOpen" in params && params.noOpen ? ["--no-open"] : [];
 			const executorArgs =
 				action === "call"
-					? [
-							"call",
-							"--stdin",
-							"--base-url",
-							baseUrl,
-							...("noOpen" in params && params.noOpen ? ["--no-open"] : []),
-						]
-					: [
-							"resume",
-							"--execution-id",
-							params.executionId,
-							"--base-url",
-							baseUrl,
-							...("noOpen" in params && params.noOpen ? ["--no-open"] : []),
-						];
+					? ["call", "--stdin", "--base-url", baseUrl, ...noOpenFlag]
+					: ["resume", "--execution-id", params.executionId ?? "", "--base-url", baseUrl, ...noOpenFlag];
 
 			const result = await runExecutorCli(cli, executorArgs, {
 				stdinText: action === "call" ? params.code : undefined,

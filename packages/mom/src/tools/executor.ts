@@ -13,6 +13,21 @@ type ExecutorCliCommand = {
 	cwd: string;
 };
 
+interface ExecutorExecutionEnvelope {
+	execution: {
+		id: string;
+		status: "pending" | "running" | "waiting_for_interaction" | "completed" | "failed" | "cancelled";
+		resultJson: string | null;
+		errorText: string | null;
+	};
+	pendingInteraction: {
+		id: string;
+		purpose?: string;
+		kind?: string;
+		payloadJson: string;
+	} | null;
+}
+
 type ParsedExecutorOutput =
 	| { kind: "completed"; text: string; parsedJson?: unknown }
 	| {
@@ -49,24 +64,27 @@ interface ExecutorToolDetails {
 	url?: string | null;
 }
 
+/**
+ * Sentinel key in tool result details that tells mom host code this is a paused
+ * executor execution awaiting human approval. Never exposed to the model.
+ */
+export const MOM_APPROVAL_PENDING_KEY = "__momApprovalPending";
+
+/**
+ * Model-facing schema: only "call" action is exposed.
+ * "resume" is handled host-side after approval and never offered to the model.
+ */
 const executorSchema = Type.Object({
 	label: Type.String({
 		description: "Brief description of what this executor run does (shown to user)",
 	}),
-	action: StringEnum(["call", "resume"] as const, {
-		description: 'Use "call" to run TypeScript, or "resume" to continue a paused execution.',
+	action: StringEnum(["call"] as const, {
+		description: 'Use "call" to run TypeScript inside executor runtime.',
 	}),
-	code: Type.Optional(
-		Type.String({
-			description:
-				"TypeScript code to execute when action=\"call\". This runs inside executor's runtime, not Node.js, bash, or mom's host process. Runtime APIs are exposed under tools.*.",
-		}),
-	),
-	executionId: Type.Optional(
-		Type.String({
-			description: 'Execution ID to resume when action="resume".',
-		}),
-	),
+	code: Type.String({
+		description:
+			"TypeScript code to execute. This runs inside executor's runtime, not Node.js, bash, or mom's host process. Runtime APIs are exposed under tools.*.",
+	}),
 	baseUrl: Type.Optional(
 		Type.String({
 			description: `Executor server base URL. Defaults to ${getDefaultExecutorBaseUrl()}.`,
@@ -89,15 +107,11 @@ export function createExecutorTool(): AgentTool<typeof executorSchema> {
 		name: "executor",
 		label: "executor",
 		description:
-			"Use this for external integrations and executor runtime capabilities. It runs TypeScript in the local executor runtime or resumes a paused execution. Code run through it can use executor runtime APIs exposed under tools.*.",
+			"Use this for external integrations and executor runtime capabilities. It runs TypeScript in the local executor runtime. Code run through it can use executor runtime APIs exposed under tools.*. If executor needs human approval, it will be handled in Slack — you will receive the outcome later.",
 		parameters: executorSchema,
 		async execute(_toolCallId, params, signal) {
-			const action = params.action;
-			if (action === "call" && (!params.code || params.code.trim().length === 0)) {
+			if (!params.code || params.code.trim().length === 0) {
 				throw new Error('executor tool requires "code" when action="call"');
-			}
-			if (action === "resume" && (!params.executionId || params.executionId.trim().length === 0)) {
-				throw new Error('executor tool requires "executionId" when action="resume"');
 			}
 
 			const baseUrl =
@@ -105,35 +119,45 @@ export function createExecutorTool(): AgentTool<typeof executorSchema> {
 					? params.baseUrl.trim()
 					: getDefaultExecutorBaseUrl();
 			const cli = getExecutorCommand(getDefaultExecutorRoot());
-			const executorArgs =
-				action === "call"
-					? ["call", "--stdin", "--base-url", baseUrl, ...(params.noOpen ? ["--no-open"] : [])]
-					: [
-							"resume",
-							"--execution-id",
-							params.executionId!,
-							"--base-url",
-							baseUrl,
-							...(params.noOpen ? ["--no-open"] : []),
-						];
+			const executorArgs = ["call", "--stdin", "--base-url", baseUrl, "--no-open"];
 
 			const result = await runExecutorCli(cli, executorArgs, {
-				stdinText: action === "call" ? params.code : undefined,
+				stdinText: params.code,
 				signal,
 				timeoutMs: params.timeoutMs,
 			});
 
 			const command = [cli.command, ...cli.args, ...executorArgs];
 			const parsed = parseExecutorOutput(result.stdout, result.code);
-			const formatted = formatExecutorResult(parsed, command, baseUrl, action);
+			const formatted = formatExecutorResult(parsed, command, baseUrl, "call");
 
 			if (parsed.kind === "waiting_for_interaction") {
-				throw new Error(
-					[
-						formatted.text,
-						"Milestone 1 does not support approval/resume flows yet. Retry after the executor action is made non-interactive or implement Milestone 2 approvals.",
-					].join("\n\n"),
-				);
+				// Return a special result that mom's afterToolCall hook will intercept.
+				// The __momApprovalPending marker in details triggers approval flow.
+				return {
+					content: [
+						{ type: "text", text: "⏳ This action requires human approval. Waiting for review in Slack." },
+					],
+					details: {
+						[MOM_APPROVAL_PENDING_KEY]: true,
+						action: "call",
+						status: "waiting_for_interaction",
+						command,
+						baseUrl,
+						label: params.label,
+						executionId: parsed.paused.id,
+						interactionId: parsed.paused.interactionId,
+						resumeCommand: parsed.paused.resumeCommand,
+						instruction: parsed.paused.instruction,
+						requestedSchema: parsed.paused.interaction?.requestedSchema ?? null,
+						url: parsed.paused.interaction?.url ?? null,
+						originalArgs: { ...params },
+					} satisfies ExecutorToolDetails & {
+						[MOM_APPROVAL_PENDING_KEY]: true;
+						label: string;
+						originalArgs: Record<string, unknown>;
+					},
+				};
 			}
 
 			if (result.code !== 0) {
@@ -158,6 +182,23 @@ export function createExecutorTool(): AgentTool<typeof executorSchema> {
 	};
 }
 
+/**
+ * Host-only: resume a paused executor execution after approval.
+ * Not exposed as a model tool.
+ */
+export async function resumeExecutorExecution(params: {
+	executionId: string;
+	baseUrl?: string;
+	noOpen?: boolean;
+	timeoutMs?: number;
+	input?: Record<string, unknown>;
+}): Promise<{ text: string; details: ExecutorToolDetails }> {
+	const baseUrl = params.baseUrl?.trim() || getDefaultExecutorBaseUrl();
+	const workspaceId = await fetchLocalWorkspaceId(baseUrl);
+	const envelope = await resumeExecutorViaHttp(baseUrl, workspaceId, params.executionId, params.input);
+	return formatExecutorEnvelope(envelope, baseUrl, "resume");
+}
+
 function getExecutorCommand(root: string): ExecutorCliCommand {
 	return {
 		command: "bun",
@@ -174,6 +215,47 @@ function getDefaultExecutorBaseUrl(): string {
 	return process.env.MOM_EXECUTOR_BASE_URL ?? FALLBACK_EXECUTOR_BASE_URL;
 }
 
+async function fetchLocalWorkspaceId(baseUrl: string): Promise<string> {
+	const response = await fetch(`${baseUrl}/v1/local/installation`);
+	if (!response.ok) {
+		throw new Error(`Failed to fetch executor installation (${response.status} ${response.statusText})`);
+	}
+	const payload = (await response.json()) as { scopeId?: string };
+	if (!payload.scopeId || typeof payload.scopeId !== "string") {
+		throw new Error("Executor installation response did not include scopeId");
+	}
+	return payload.scopeId;
+}
+
+async function resumeExecutorViaHttp(
+	baseUrl: string,
+	workspaceId: string,
+	executionId: string,
+	input: Record<string, unknown> | undefined,
+): Promise<ExecutorExecutionEnvelope> {
+	const approved = input?.approve === true;
+	const response = await fetch(`${baseUrl}/v1/workspaces/${workspaceId}/executions/${executionId}/resume`, {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+		},
+		body: JSON.stringify({
+			interactionMode: "live_form",
+			responseJson: JSON.stringify({
+				action: approved ? "accept" : "decline",
+				content: input ?? {},
+			}),
+		}),
+	});
+	if (!response.ok) {
+		const errorText = (await response.text()).trim();
+		throw new Error(
+			`Failed to resume executor execution (${response.status} ${response.statusText})${errorText ? `\n\n${errorText}` : ""}`,
+		);
+	}
+	return (await response.json()) as ExecutorExecutionEnvelope;
+}
+
 function runExecutorCli(
 	command: ExecutorCliCommand,
 	executorArgs: string[],
@@ -181,14 +263,21 @@ function runExecutorCli(
 		stdinText?: string;
 		signal?: AbortSignal;
 		timeoutMs?: number;
+		usePty?: boolean;
 	},
 ): Promise<{ stdout: string; stderr: string; code: number | null; killed: boolean }> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(command.command, [...command.args, ...executorArgs], {
-			cwd: command.cwd,
-			stdio: ["pipe", "pipe", "pipe"],
-			shell: false,
-		});
+		const child = options.usePty
+			? spawn("script", ["-q", "/dev/null", command.command, ...command.args, ...executorArgs], {
+					cwd: command.cwd,
+					stdio: ["pipe", "pipe", "pipe"],
+					shell: false,
+				})
+			: spawn(command.command, [...command.args, ...executorArgs], {
+					cwd: command.cwd,
+					stdio: ["pipe", "pipe", "pipe"],
+					shell: false,
+				});
 
 		let stdout = "";
 		let stderr = "";
@@ -248,19 +337,31 @@ function runExecutorCli(
 	});
 }
 
-function tryParseJson(text: string): unknown | undefined {
+function tryParseJson(text: string): { parsedJson?: unknown; parsedText?: string } {
 	const trimmed = text.trim();
-	if (!trimmed) return undefined;
+	if (!trimmed) return {};
 	try {
-		return JSON.parse(trimmed);
+		return { parsedJson: JSON.parse(trimmed), parsedText: trimmed };
 	} catch {
-		return undefined;
+		const lines = trimmed
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const line = lines[i]!;
+			try {
+				return { parsedJson: JSON.parse(line), parsedText: line };
+			} catch {
+				// continue scanning upward for the final JSON payload line
+			}
+		}
+		return {};
 	}
 }
 
 function parseExecutorOutput(stdout: string, exitCode: number | null): ParsedExecutorOutput {
 	const trimmed = stdout.trim();
-	const parsedJson = tryParseJson(trimmed);
+	const { parsedJson, parsedText } = tryParseJson(trimmed);
 
 	if (
 		exitCode === 20 &&
@@ -281,9 +382,25 @@ function parseExecutorOutput(stdout: string, exitCode: number | null): ParsedExe
 
 	return {
 		kind: "completed",
-		text: trimmed.length > 0 ? trimmed : "(no output)",
+		text: parsedText ?? (trimmed.length > 0 ? trimmed : "(no output)"),
 		parsedJson,
 	};
+}
+
+function formatInteractiveResponseInput(input: Record<string, unknown>): string {
+	const lines = Object.values(input).map((value) => {
+		if (typeof value === "boolean") {
+			return value ? "yes" : "no";
+		}
+		if (typeof value === "number" || typeof value === "bigint") {
+			return String(value);
+		}
+		if (typeof value === "string") {
+			return value;
+		}
+		return JSON.stringify(value);
+	});
+	return `${lines.join("\n")}\n`;
 }
 
 function truncateOutput(text: string): { text: string; truncation?: TruncationResult } {
@@ -344,6 +461,66 @@ function formatExecutorResult(
 			baseUrl,
 			truncation: truncated.truncation,
 			parsedJson: output.parsedJson,
+		},
+	};
+}
+
+function formatExecutorEnvelope(
+	envelope: ExecutorExecutionEnvelope,
+	baseUrl: string,
+	action: "call" | "resume",
+): { text: string; details: ExecutorToolDetails } {
+	if (envelope.execution.status === "waiting_for_interaction" && envelope.pendingInteraction) {
+		let instruction = "Execution paused because executor needs additional input.";
+		let requestedSchema: Record<string, unknown> | null = null;
+		try {
+			const payload = JSON.parse(envelope.pendingInteraction.payloadJson) as {
+				elicitation?: { message?: string; requestedSchema?: Record<string, unknown> };
+			};
+			const message = payload.elicitation?.message;
+			if (typeof message === "string" && message.trim().length > 0) {
+				instruction = `Execution paused because executor needs additional input. The interaction prompt is "${message}".`;
+			}
+			requestedSchema = payload.elicitation?.requestedSchema ?? null;
+		} catch {
+			// Keep fallback instruction
+		}
+		return {
+			text: `${instruction}\nExecution ID: ${envelope.execution.id}`,
+			details: {
+				action,
+				status: "waiting_for_interaction",
+				command: [],
+				baseUrl,
+				executionId: envelope.execution.id,
+				interactionId: envelope.pendingInteraction.id,
+				instruction,
+				requestedSchema,
+				url: null,
+			},
+		};
+	}
+
+	if (envelope.execution.status === "failed") {
+		throw new Error(envelope.execution.errorText ?? "Execution failed");
+	}
+
+	const text = envelope.execution.resultJson?.trim() || "completed";
+	const truncated = truncateOutput(text);
+	let formattedText = truncated.text;
+	if (truncated.truncation) {
+		formattedText += `\n\n[Output truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.]`;
+	}
+	return {
+		text: formattedText,
+		details: {
+			action,
+			status: "completed",
+			command: [],
+			baseUrl,
+			truncation: truncated.truncation,
+			parsedJson: tryParseJson(text).parsedJson,
+			executionId: envelope.execution.id,
 		},
 	};
 }

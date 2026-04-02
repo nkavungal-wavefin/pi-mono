@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
+import { test } from "vitest";
 import { buildSystemPrompt } from "../src/agent.js";
 import type { Executor } from "../src/sandbox.js";
 import { createMomTools } from "../src/tools/index.js";
@@ -32,7 +32,7 @@ test("milestone 1 tool profile includes discovery tools and excludes bash", () =
 	assert.ok(!names.includes("bash"));
 });
 
-test("executor tool errors on paused executions for milestone 1", async () => {
+test("executor tool returns approval-pending result on paused executions (M2)", async () => {
 	const tempRoot = mkdtempSync(join(tmpdir(), "mom-executor-test-"));
 	mkdirSync(join(tempRoot, "apps", "executor", "bin"), { recursive: true });
 	writeFileSync(
@@ -60,16 +60,20 @@ exit 20
 	try {
 		const tool = createMomTools(new FakeExecutor(new Map())).find((entry) => entry.name === "executor");
 		assert.ok(tool);
-		await assert.rejects(
-			() =>
-				tool!.execute("tool-call-1", {
-					label: "Run external integration",
-					action: "call",
-					code: "return 1;",
-					noOpen: true,
-				}),
-			/does not support approval\/resume flows yet/i,
-		);
+		const result = await tool!.execute("tool-call-1", {
+			label: "Run external integration",
+			action: "call",
+			code: "return 1;",
+			noOpen: true,
+		});
+		// Should NOT throw — returns a special approval-pending result
+		assert.ok(result.content[0]);
+		assert.match((result.content[0] as { text: string }).text, /approval/i);
+		// Details must contain the approval marker
+		const details = result.details as Record<string, unknown>;
+		assert.strictEqual(details.__momApprovalPending, true);
+		assert.strictEqual(details.executionId, "exec_123");
+		assert.strictEqual(details.status, "waiting_for_interaction");
 	} finally {
 		if (previousRoot === undefined) delete process.env.MOM_EXECUTOR_ROOT;
 		else process.env.MOM_EXECUTOR_ROOT = previousRoot;
@@ -77,7 +81,7 @@ exit 20
 	}
 });
 
-test("system prompt reflects milestone 1 contract", () => {
+test("system prompt reflects milestone 2 approval contract", () => {
 	const prompt = buildSystemPrompt(
 		"/workspace",
 		"C123",
@@ -94,6 +98,9 @@ test("system prompt reflects milestone 1 contract", () => {
 	assert.match(prompt, /grep: Search file contents/);
 	assert.match(prompt, /find: Search for files by glob pattern/);
 	assert.doesNotMatch(prompt, /Run shell commands \(primary tool\)/);
+	// M2: prompt mentions approval flow
+	assert.match(prompt, /approval/i);
+	assert.doesNotMatch(prompt, /treat that as an error/i);
 });
 
 test("ls tool returns directory entries", async () => {

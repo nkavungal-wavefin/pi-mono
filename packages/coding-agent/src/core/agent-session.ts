@@ -23,7 +23,7 @@ import type {
 	AgentTool,
 	ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
+import type { AssistantMessage, ImageContent, Message, Model, TextContent, ToolResultMessage } from "@mariozechner/pi-ai";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
 import { getDocsPath } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
@@ -129,7 +129,7 @@ export type AgentSessionEvent =
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 
 /** Listener function for agent session events */
-export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+export type AgentSessionEventListener = (event: AgentSessionEvent) => void | Promise<void>;
 
 // ============================================================================
 // Types
@@ -361,21 +361,31 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+		const existingBeforeToolCall = this.agent.beforeToolCall;
+		const existingAfterToolCall = this.agent.afterToolCall;
+
+		this.agent.beforeToolCall = async (context, signal) => {
+			const existingResult = existingBeforeToolCall ? await existingBeforeToolCall(context, signal) : undefined;
+			if (existingResult?.block) {
+				return existingResult;
+			}
+
+			const { toolCall, args } = context;
 			const runner = this._extensionRunner;
 			if (!runner?.hasHandlers("tool_call")) {
-				return undefined;
+				return existingResult;
 			}
 
 			await this._agentEventQueue;
 
 			try {
-				return await runner.emitToolCall({
+				const runnerResult = await runner.emitToolCall({
 					type: "tool_call",
 					toolName: toolCall.name,
 					toolCallId: toolCall.id,
 					input: args as Record<string, unknown>,
 				});
+				return runnerResult ?? existingResult;
 			} catch (err) {
 				if (err instanceof Error) {
 					throw err;
@@ -384,10 +394,34 @@ export class AgentSession {
 			}
 		};
 
-		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+		this.agent.afterToolCall = async (context, signal) => {
+			let currentResult = context.result;
+			let currentIsError = context.isError;
+			let modified = false;
+
+			if (existingAfterToolCall) {
+				const existingResult = await existingAfterToolCall(context, signal);
+				if (existingResult) {
+					currentResult = {
+						content: existingResult.content ?? currentResult.content,
+						details: existingResult.details ?? currentResult.details,
+					};
+					currentIsError = existingResult.isError ?? currentIsError;
+					modified = true;
+				}
+			}
+
+			const { toolCall, args } = context;
 			const runner = this._extensionRunner;
 			if (!runner?.hasHandlers("tool_result")) {
-				return undefined;
+				if (!modified) {
+					return undefined;
+				}
+				return {
+					content: currentResult.content,
+					details: currentResult.details,
+					isError: currentIsError,
+				};
 			}
 
 			const hookResult = await runner.emitToolResult({
@@ -395,18 +429,28 @@ export class AgentSession {
 				toolName: toolCall.name,
 				toolCallId: toolCall.id,
 				input: args as Record<string, unknown>,
-				content: result.content,
-				details: isError ? undefined : result.details,
-				isError,
+				content: currentResult.content,
+				details: currentIsError ? undefined : currentResult.details,
+				isError: currentIsError,
 			});
 
-			if (!hookResult || isError) {
+			if (hookResult) {
+				currentResult = {
+					content: hookResult.content ?? currentResult.content,
+					details: hookResult.details ?? currentResult.details,
+				};
+				currentIsError = hookResult.isError ?? currentIsError;
+				modified = true;
+			}
+
+			if (!modified) {
 				return undefined;
 			}
 
 			return {
-				content: hookResult.content,
-				details: hookResult.details,
+				content: currentResult.content,
+				details: currentResult.details,
+				isError: currentIsError,
 			};
 		};
 	}
@@ -416,14 +460,14 @@ export class AgentSession {
 	// =========================================================================
 
 	/** Emit an event to all listeners */
-	private _emit(event: AgentSessionEvent): void {
+	private async _emit(event: AgentSessionEvent): Promise<void> {
 		for (const l of this._eventListeners) {
-			l(event);
+			await l(event);
 		}
 	}
 
 	private _emitQueueUpdate(): void {
-		this._emit({
+		void this._emit({
 			type: "queue_update",
 			steering: [...this._steeringMessages],
 			followUp: [...this._followUpMessages],
@@ -508,7 +552,7 @@ export class AgentSession {
 		await this._emitExtensionEvent(event);
 
 		// Notify all listeners
-		this._emit(event);
+		await this._emit(event);
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -1063,6 +1107,7 @@ export class AgentSession {
 
 		await this.agent.prompt(messages);
 		await this.waitForRetry();
+		await this._waitForAgentEventQueue();
 	}
 
 	/**
@@ -1253,6 +1298,8 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			await this.agent.prompt(appMessage);
+			await this.waitForRetry();
+			await this._waitForAgentEventQueue();
 		} else {
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
@@ -1307,6 +1354,93 @@ export class AgentSession {
 	}
 
 	/**
+	 * Append a synthetic tool result to the current transcript.
+	 * Useful for host-owned workflows that complete a deferred tool call outside the model loop.
+	 */
+	async appendToolResult(
+		input: Pick<ToolResultMessage, "toolCallId" | "toolName" | "content" | "details" | "isError">,
+		options?: { continue?: boolean },
+	): Promise<void> {
+		if (this.isStreaming) {
+			throw new Error("Agent is already processing. Wait for completion before appending a tool result.");
+		}
+
+		this._flushPendingBashMessages();
+
+		const message: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: input.toolCallId,
+			toolName: input.toolName,
+			content: input.content,
+			details: input.details,
+			isError: input.isError,
+			timestamp: Date.now(),
+		};
+
+		await this._processAgentEvent({
+			type: "tool_execution_end",
+			toolCallId: message.toolCallId,
+			toolName: message.toolName,
+			result: {
+				content: message.content,
+				details: message.details,
+			},
+			isError: message.isError,
+		});
+		await this._processAgentEvent({ type: "message_start", message });
+		this.agent.state.messages.push(message);
+		await this._processAgentEvent({ type: "message_end", message });
+
+		if (options?.continue) {
+			await this.continue();
+		}
+	}
+
+	/**
+	 * Continue from the current transcript.
+	 * The last message must be a user or toolResult message.
+	 */
+	async continue(): Promise<void> {
+		if (this.isStreaming) {
+			throw new Error("Agent is already processing. Wait for completion before continuing.");
+		}
+
+		this._flushPendingBashMessages();
+
+		if (!this.model) {
+			throw new Error(
+				"No model selected.\n\n" +
+					`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}\n\n` +
+					"Then use /model to select a model.",
+			);
+		}
+
+		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
+			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
+			if (isOAuth) {
+				throw new Error(
+					`Authentication failed for "${this.model.provider}". ` +
+						`Credentials may have expired or network is unavailable. ` +
+						`Run '/login ${this.model.provider}' to re-authenticate.`,
+				);
+			}
+			throw new Error(
+				`No API key found for ${this.model.provider}.\n\n` +
+					`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}`,
+			);
+		}
+
+		const lastAssistant = this._findLastAssistantMessage();
+		if (lastAssistant) {
+			await this._checkCompaction(lastAssistant, false);
+		}
+
+		await this.agent.continue();
+		await this.waitForRetry();
+		await this._waitForAgentEventQueue();
+	}
+
+	/**
 	 * Clear all queued messages and return them.
 	 * Useful for restoring to editor when user aborts.
 	 * @returns Object with steering and followUp arrays
@@ -1347,6 +1481,7 @@ export class AgentSession {
 		this.abortRetry();
 		this.agent.abort();
 		await this.agent.waitForIdle();
+		await this._waitForAgentEventQueue();
 	}
 
 	// =========================================================================
@@ -2492,6 +2627,10 @@ export class AgentSession {
 
 		await this._retryPromise;
 		await this.agent.waitForIdle();
+	}
+
+	private async _waitForAgentEventQueue(): Promise<void> {
+		await this._agentEventQueue;
 	}
 
 	/** Whether auto-retry is currently in progress */

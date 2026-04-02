@@ -16,11 +16,14 @@ import { existsSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import { type PendingApproval, saveApproval } from "./approvals.js";
+import type { ApprovalActionResult } from "./approval-actions.js";
 import { createMomSettingsManager, syncLogToSessionManager } from "./context.js";
 import * as log from "./log.js";
 import { createExecutor, type SandboxConfig } from "./sandbox.js";
 import type { ChannelInfo, SlackContext, UserInfo } from "./slack.js";
 import type { ChannelStore } from "./store.js";
+import { MOM_APPROVAL_PENDING_KEY } from "./tools/executor.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
@@ -41,6 +44,21 @@ export interface AgentRunner {
 		pendingMessages?: PendingMessage[],
 	): Promise<{ stopReason: string; errorMessage?: string }>;
 	abort(): void;
+	/**
+	 * Continue the conversation after an approval is resolved.
+	 * Completes the paused tool call with a synthetic tool result
+	 * and triggers a new inference request in the same session.
+	 */
+	continueAfterApproval(
+		ctx: SlackContext,
+		store: ChannelStore,
+		resolution: ApprovalActionResult,
+	): Promise<{ stopReason: string; errorMessage?: string }>;
+	/**
+	 * Set the callback that fires when an executor tool pauses for approval.
+	 * The callback receives the PendingApproval and should post the approval widget.
+	 */
+	setApprovalCallback(callback: (approval: PendingApproval) => Promise<void>): void;
 }
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
@@ -309,7 +327,7 @@ Rules:
 - Use \`executor\` for external integrations such as Datadog, Atlassian, and other runtime capabilities outside simple local file work.
 - The \`executor\` tool runs TypeScript inside executor's runtime, not Node.js, not shell, and not mom's host process.
 - Discover executor capabilities by intent with \`tools.discover(...)\` inside executor call code when needed.
-- If executor returns a paused execution, treat that as an error for this milestone. Do not attempt to resume it.
+- If executor pauses for human approval, Slack will show an approve/reject widget. You will receive the outcome when the human decides. Do not attempt to resume, manage browser prompts, or handle approval flows yourself.
 
 Each tool requires a "label" parameter (shown to user).
 `;
@@ -419,6 +437,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const modelRegistry = ModelRegistry.create(authStorage);
 	const resolvedModel = modelRegistry.find(model.provider, model.id) ?? model;
 
+	// Parent of channelDir — the workspace root used for approval storage
+	const workspaceDir = join(channelDir, "..");
+
 	// Create agent
 	const agent = new Agent({
 		initialState: {
@@ -438,6 +459,45 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				apiKey: auth.apiKey,
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
+		},
+		afterToolCall: async (context) => {
+			const details = context.result.details as Record<string, unknown> | undefined;
+			if (!details || !details[MOM_APPROVAL_PENDING_KEY]) return undefined;
+
+			// This is a paused executor execution. Save approval state.
+			const approval: PendingApproval = {
+				channelId,
+				toolCallId: context.toolCall.id,
+				toolName: context.toolCall.name,
+				label: (details.label as string) || "executor",
+				branchFromEntryId: sessionManager.getLeafId() ?? undefined,
+				executorExecutionId: details.executionId as string,
+				interactionId: details.interactionId as string | undefined,
+				instruction: details.instruction as string | undefined,
+				resumeCommand: details.resumeCommand as string | undefined,
+				requestedSchema: details.requestedSchema as Record<string, unknown> | null,
+				url: details.url as string | null,
+				originalArgs: (details.originalArgs as Record<string, unknown>) || {},
+				baseUrl: details.baseUrl as string,
+				status: "pending",
+				createdAt: new Date().toISOString(),
+			};
+			saveApproval(workspaceDir, approval);
+			runState.pendingApproval = approval;
+
+			log.logInfo(`[${channelId}] Executor paused: ${approval.label} (${approval.executorExecutionId})`);
+
+			// Keep the approval-pending content visible to the model so it knows the call is paused.
+			// Strip the internal marker from what gets persisted.
+			return {
+				content: context.result.content,
+				details: {
+					action: details.action,
+					status: details.status,
+					executionId: details.executionId,
+					instruction: details.instruction,
+				},
+			};
 		},
 		sessionId: sessionManager.getSessionId(),
 	});
@@ -492,6 +552,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		},
 		stopReason: "stop",
 		errorMessage: undefined as string | undefined,
+		/** Set by afterToolCall when executor pauses for approval */
+		pendingApproval: null as PendingApproval | null,
+		/** Callback to post approval widget from the event subscriber */
+		onApprovalPending: null as ((approval: PendingApproval) => Promise<void>) | null,
 	};
 
 	// Subscribe to events ONCE
@@ -526,6 +590,24 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				log.logToolError(logCtx, agentEvent.toolName, durationMs, resultStr);
 			} else {
 				log.logToolSuccess(logCtx, agentEvent.toolName, durationMs, resultStr);
+			}
+
+			// Check if this is a paused approval — abort the run so the model
+			// doesn't continue until the human approves/rejects.
+			if (runState.pendingApproval) {
+				const approval = runState.pendingApproval;
+				log.logInfo(`[${channelId}] Approval pending for "${approval.label}" — aborting run`);
+
+				// Post approval widget to Slack
+				if (runState.onApprovalPending) {
+					queue.enqueue(() => runState.onApprovalPending!(approval), "approval widget");
+				}
+
+				// Abort the underlying agent loop directly. Calling AgentSession.abort()
+				// from inside the session's own event subscriber can race its event queue
+				// and drop the approval transition before the run settles.
+				agent.abort();
+				return;
 			}
 
 			// Post args + result to thread
@@ -697,6 +779,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			};
 			runState.stopReason = "stop";
 			runState.errorMessage = undefined;
+			runState.pendingApproval = null;
 
 			// Create queue for this run
 			let queueChain = Promise.resolve();
@@ -782,6 +865,17 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// Wait for queued messages
 			await queueChain;
 
+			// If run was aborted due to pending approval, skip normal post-run handling.
+			// The approval widget has already been posted.
+			const pendingApproval = runState.pendingApproval as PendingApproval | null;
+			if (pendingApproval) {
+				log.logInfo(`[${channelId}] Run ended with pending approval for "${pendingApproval.label}"`);
+				runState.ctx = null;
+				runState.logCtx = null;
+				runState.queue = null;
+				return { stopReason: "approval_pending", errorMessage: undefined };
+			}
+
 			// Handle error case - update main message and post error to thread
 			if (runState.stopReason === "error" && runState.errorMessage) {
 				if (MOM_VERBOSE_LOGGING) {
@@ -859,6 +953,177 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 		abort(): void {
 			session.abort();
+		},
+
+		async continueAfterApproval(
+			ctx: SlackContext,
+			_store: ChannelStore,
+			resolution: ApprovalActionResult,
+		): Promise<{ stopReason: string; errorMessage?: string }> {
+			await mkdir(channelDir, { recursive: true });
+
+			// Sync any new messages
+			const syncedCount = syncLogToSessionManager(sessionManager, channelDir);
+			if (syncedCount > 0) {
+				log.logInfo(`[${channelId}] Synced ${syncedCount} messages from log.jsonl (continuation)`);
+			}
+
+			// Reload messages
+			const reloadedSession = sessionManager.buildSessionContext();
+			if (reloadedSession.messages.length > 0) {
+				agent.state.messages = reloadedSession.messages;
+			}
+
+			const branchFromEntryId = resolution.approval.branchFromEntryId ?? null;
+			if (branchFromEntryId) {
+				sessionManager.branch(branchFromEntryId);
+				const branchedSession = sessionManager.buildSessionContext();
+				agent.state.messages = branchedSession.messages;
+			}
+
+			// Update system prompt
+			const memory = getMemory(channelDir);
+			const skills = loadMomSkills(channelDir, workspacePath);
+			const freshSystemPrompt = buildSystemPrompt(
+				workspacePath,
+				channelId,
+				memory,
+				sandboxConfig,
+				ctx.channels,
+				ctx.users,
+				skills,
+			);
+			session.agent.state.systemPrompt = freshSystemPrompt;
+
+			// Set up file upload
+			setUploadFunction(async (filePath: string, title?: string) => {
+				const hostPath = translateToHostPath(filePath, channelDir, workspacePath, channelId);
+				await ctx.uploadFile(hostPath, title);
+			});
+
+			// Reset run state for continuation
+			runState.ctx = ctx;
+			runState.logCtx = {
+				channelId: ctx.message.channel,
+				userName: ctx.message.userName,
+				channelName: ctx.channelName,
+			};
+			runState.pendingTools.clear();
+			runState.totalUsage = {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+			runState.stopReason = "stop";
+			runState.errorMessage = undefined;
+			runState.pendingApproval = null;
+
+			// Create queue for this continuation
+			let queueChain = Promise.resolve();
+			runState.queue = {
+				enqueue(fn: () => Promise<void>, errorContext: string): void {
+					queueChain = queueChain.then(async () => {
+						try {
+							await fn();
+						} catch (err) {
+							const errMsg = err instanceof Error ? err.message : String(err);
+							log.logWarning(`Slack API error (${errorContext})`, errMsg);
+						}
+					});
+				},
+				enqueueMessage(text: string, target: "main" | "thread", errorContext: string, doLog = true): void {
+					const parts = splitForSlack(text);
+					for (const part of parts) {
+						this.enqueue(
+							() => (target === "main" ? ctx.respond(part, doLog) : ctx.respondInThread(part)),
+							errorContext,
+						);
+					}
+				},
+			};
+
+			log.logInfo(
+				`[${channelId}] Continuing after approval for tool call ${resolution.approval.toolCallId.substring(0, 80)}`,
+			);
+			await session.appendToolResult(
+				{
+					toolCallId: resolution.approval.toolCallId,
+					toolName: resolution.approval.toolName,
+					content: [{ type: "text", text: resolution.toolResultText }],
+					details: {
+						action: "resume",
+						status: resolution.approved ? "completed" : "rejected",
+						executionId: resolution.approval.executorExecutionId,
+						approved: resolution.approved,
+					},
+					isError: resolution.toolResultIsError,
+				},
+				{ continue: true },
+			);
+
+			// Wait for queued messages
+			await queueChain;
+
+			// Standard post-run handling (same as run)
+			if (runState.pendingApproval) {
+				log.logInfo(`[${channelId}] Continuation ended with another pending approval`);
+				runState.ctx = null;
+				runState.logCtx = null;
+				runState.queue = null;
+				return { stopReason: "approval_pending", errorMessage: undefined };
+			}
+
+			if (runState.stopReason !== "error") {
+				const messages = session.messages;
+				const lastAssistant = messages.filter((m) => m.role === "assistant").pop();
+				const finalText =
+					lastAssistant?.content
+						.filter((c): c is { type: "text"; text: string } => c.type === "text")
+						.map((c) => c.text)
+						.join("\n") || "";
+
+				if (finalText.trim() && finalText.trim() !== "[SILENT]" && !finalText.trim().startsWith("[SILENT]")) {
+					try {
+						const mainText =
+							finalText.length > SLACK_MAX_LENGTH
+								? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
+								: finalText;
+						await ctx.replaceMessage(mainText);
+					} catch (err) {
+						log.logWarning("Failed to replace message", err instanceof Error ? err.message : String(err));
+					}
+				}
+			}
+
+			// Usage summary
+			if (runState.totalUsage.cost.total > 0 && runState.logCtx) {
+				const messages = session.messages;
+				const lastAssistantMessage = messages
+					.slice()
+					.reverse()
+					.find((m) => m.role === "assistant" && (m as any).stopReason !== "aborted") as any;
+				const contextTokens = lastAssistantMessage
+					? lastAssistantMessage.usage.input +
+						lastAssistantMessage.usage.output +
+						lastAssistantMessage.usage.cacheRead +
+						lastAssistantMessage.usage.cacheWrite
+					: 0;
+				const contextWindow = model.contextWindow || 200000;
+				const summary = log.logUsageSummary(runState.logCtx, runState.totalUsage, contextTokens, contextWindow);
+				runState.queue.enqueue(() => ctx.respondInThread(summary), "usage summary");
+				await queueChain;
+			}
+
+			runState.ctx = null;
+			runState.logCtx = null;
+			runState.queue = null;
+			return { stopReason: runState.stopReason, errorMessage: runState.errorMessage };
+		},
+
+		setApprovalCallback(callback: (approval: PendingApproval) => Promise<void>): void {
+			runState.onApprovalPending = callback;
 		},
 	};
 }
