@@ -11,7 +11,7 @@ Investigate a Jira service desk or customer issue ticket, find the relevant play
 
 ### Step 1 — Read the Ticket
 
-Use `executor` to fetch the Jira issue. Pass the issue key provided by the user (e.g. `SD-1234`, `SUPPORT-567`).
+Use `executor` to fetch the Jira issue. Pass the issue key provided by the user (e.g. `SD-1234`, `SUPPORT-567`). DO NOT USE THE RELATED TICKET and use data from the provided ticket only. If you don't have sufficient information from the provided ticket, ask the user for more details instead of looking at related tickets.
 
 ```typescript
 const issue = await tools.atlassian.mcp.getjiraissue({
@@ -30,7 +30,25 @@ Extract from the result:
 
 If the description references other tickets, fetch those too for context.
 
-### Step 2 — Search for a Playbook
+### Step 2 — Find the Right Tool
+
+Discover what executor tools are available for the issue. Use `tools.discover()` with the `query` parameter (NOT `intent` — that will error).
+
+```typescript
+const discovered = await tools.discover({
+  query: "run a rake task to <describe what needs to happen based on the ticket>"
+});
+return discovered;
+```
+
+If you need to see what rake tasks exist, list them:
+
+```typescript
+const result = await tools.demo['run-rake-task']({ task: '--tasks' });
+return result;
+```
+
+### Step 3 — Search for a Playbook
 
 Search Confluence for a relevant runbook or playbook using keywords from the ticket.
 
@@ -63,7 +81,7 @@ const page = await tools.atlassian.mcp.getconfluencepage({
 return page;
 ```
 
-### Step 3 — Present Findings
+### Step 4 — Present Findings
 
 Summarize your findings to the user in this format:
 
@@ -91,18 +109,28 @@ Should I run this command to resolve the issue? (yes/no)
 
 Wait for user confirmation before proceeding. *Never execute a management command or rake task without explicit user approval.*
 
-### Step 4 — Execute (Only After Approval)
+### Step 5 — Execute (Only After Approval)
 
-If the user approves, run the command via executor. The exact code depends on what's available in the executor runtime. For rake tasks:
+If the user approves, run the command via executor.
+
+**For rake tasks**, use `tools.demo['run-rake-task']` with the `task` parameter. Arguments to the rake task use **Ruby bracket syntax** appended to the task name — do NOT use the `args` field for positional rake arguments.
 
 ```typescript
-const result = await tools.demo["run-rake-task"]();
+// Correct — bracket syntax for rake task arguments:
+const result = await tools.demo['run-rake-task']({
+  task: 'hackathon:disable_requires_ytd[9f506719-73c0-4043-8242-4dd126b3c034]'
+});
 return result;
+
+// WRONG — this will fail with "business_id is required":
+// tools.demo['run-rake-task']({ task: 'hackathon:disable_requires_ytd', args: 'business_id=...' })
 ```
+
+The `args` field is only for extra environment-variable-style arguments (e.g. `args: 'RAILS_ENV=production'`), not for positional rake task parameters.
 
 For other management commands, write the appropriate executor TypeScript code based on the playbook instructions and available `tools.*` APIs.
 
-### Step 5 — Summarize
+### Step 6 — Summarize
 
 After execution (or if no command was needed), provide a concise summary:
 
@@ -134,3 +162,11 @@ await tools.atlassian.mcp.addcommenttojiraissue({
 - If no playbook is found, analyze the ticket yourself and present your best assessment
 - Never run destructive commands without explicit user approval
 - If the ticket mentions a specific product area (Invoicing, Payments, Payroll, Banking), include that as a search keyword when looking for playbooks
+
+## Executor API Gotchas
+
+- `tools.discover()` requires `query` (string), NOT `intent`. Using `intent` will error with "query: is missing"
+- Do NOT call `String()` on tool objects — it causes a `toPrimitive` error
+- Rake task positional arguments use bracket syntax: `task: 'name[arg1,arg2]'` — the `args` field is for env-var-style args only
+- List available rake tasks with `task: '--tasks'`
+- Ignore Rails deprecation warnings and constant redefinition warnings in output — they are normal noise
