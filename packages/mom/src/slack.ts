@@ -1,8 +1,10 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import type { KnownBlock } from "@slack/types";
 import { ErrorCode, type WebAPIPlatformError, WebClient } from "@slack/web-api";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "fs";
 import { basename, join } from "path";
+import type { ApprovalSummary, ApprovalSummaryField } from "./approvals.js";
+import { buildConversationInfo, type ConversationInfo, parseConversationId } from "./conversations.js";
 import * as log from "./log.js";
 import type { Attachment, ChannelStore } from "./store.js";
 
@@ -12,8 +14,10 @@ import type { Attachment, ChannelStore } from "./store.js";
 
 export interface SlackEvent {
 	type: "mention" | "dm";
+	conversationId: string;
 	channel: string;
 	ts: string;
+	threadTs?: string;
 	user: string;
 	text: string;
 	files?: Array<{ name?: string; url_private_download?: string; url_private?: string }>;
@@ -50,8 +54,10 @@ export interface SlackContext {
 		rawText: string;
 		user: string;
 		userName?: string;
+		conversationId: string;
 		channel: string;
 		ts: string;
+		threadTs?: string;
 		attachments: Array<{ local: string }>;
 	};
 	channelName?: string;
@@ -60,17 +66,27 @@ export interface SlackContext {
 	respond: (text: string, shouldLog?: boolean) => Promise<void>;
 	replaceMessage: (text: string) => Promise<void>;
 	respondInThread: (text: string) => Promise<void>;
+	setToolTimelineStatus: (status: RunStatusKind, entries: ToolTimelineEntry[]) => Promise<void>;
 	setTyping: (isTyping: boolean) => Promise<void>;
 	uploadFile: (filePath: string, title?: string) => Promise<void>;
 	setWorking: (working: boolean) => Promise<void>;
 	deleteMessage: () => Promise<void>;
 }
 
+export type ToolTimelineStatus = "in_progress" | "success" | "error" | "paused";
+
+export interface ToolTimelineEntry {
+	label: string;
+	status: ToolTimelineStatus;
+}
+
+export type RunStatusKind = "working" | "approval_pending" | "done" | "failed" | "stopped";
+
 export interface MomHandler {
 	/**
-	 * Check if channel is currently running (SYNC)
+	 * Check if conversation is currently running (SYNC)
 	 */
-	isRunning(channelId: string): boolean;
+	isRunning(conversationId: string): boolean;
 
 	/**
 	 * Handle an event that triggers mom (ASYNC)
@@ -81,9 +97,9 @@ export interface MomHandler {
 
 	/**
 	 * Handle stop command (ASYNC)
-	 * Called when user says "stop" while mom is running
+	 * Called when user says "stop" while a conversation is running
 	 */
-	handleStop(channelId: string, slack: SlackBot): Promise<void>;
+	handleStop(event: SlackEvent, slack: SlackBot): Promise<void>;
 
 	/**
 	 * Handle an approval action from Slack interactive message (ASYNC)
@@ -95,51 +111,119 @@ export interface MomHandler {
 export interface ApprovalAction {
 	actionId: "mom_approve" | "mom_reject";
 	toolCallId: string;
-	channelId: string;
+	conversationId: string;
 	userId: string;
 	messageTs: string;
 }
 
+const MAX_ASSISTANT_MESSAGE_LENGTH = 72;
+const MAX_APPROVAL_FIELD_TEXT_LENGTH = 2000;
+const MAX_APPROVAL_CONTEXT_TEXT_LENGTH = 2000;
+type AssistantThreadStatusResult = "updated" | "unsupported" | "failed";
+const UNSUPPORTED_ASSISTANT_STATUS_ERRORS = new Set([
+	"access_denied",
+	"deprecated_endpoint",
+	"invalid_auth",
+	"missing_scope",
+	"not_allowed_token_type",
+	"unknown_method",
+]);
+
+function isVerboseApprovalDescription(text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) return false;
+	if (trimmed.length > 280) return true;
+	if (trimmed.includes("\n\n")) return true;
+	if (/\n[-*]\s/.test(trimmed)) return true;
+	return false;
+}
+
+function truncateSlackText(text: string, maxLength: number): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= maxLength) return trimmed;
+	if (maxLength <= 1) return "…".slice(0, maxLength);
+	return `${trimmed.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function formatApprovalFieldText(field: ApprovalSummaryField): string {
+	const label = field.label.trim() || field.key.trim() || "Value";
+	const labelText = `*${truncateSlackText(label, 80)}*\n`;
+	const maxValueLength = Math.max(1, MAX_APPROVAL_FIELD_TEXT_LENGTH - labelText.length);
+	return `${labelText}${truncateSlackText(field.value, maxValueLength)}`;
+}
+
+function getApprovalDescriptionText(approvalDisplay?: ApprovalSummary, instruction?: string): string | undefined {
+	const description = approvalDisplay?.description?.trim();
+	if (description) {
+		const hasFields = (approvalDisplay?.fields.length ?? 0) > 0;
+		if (!(hasFields && isVerboseApprovalDescription(description))) {
+			return truncateSlackText(description, MAX_APPROVAL_CONTEXT_TEXT_LENGTH);
+		}
+	}
+	const trimmedInstruction = instruction?.trim();
+	return trimmedInstruction ? truncateSlackText(trimmedInstruction, MAX_APPROVAL_CONTEXT_TEXT_LENGTH) : undefined;
+}
+
 export function buildApprovalWidgetBlocks(
-	channelId: string,
+	conversationId: string,
 	toolCallId: string,
 	label: string,
 	instruction?: string,
+	approvalDisplay?: ApprovalSummary,
 ): KnownBlock[] {
+	const title = approvalDisplay?.title || approvalDisplay?.toolName || label;
+	const descriptionText = getApprovalDescriptionText(approvalDisplay, instruction);
 	const blocks: KnownBlock[] = [
+		{
+			type: "header",
+			text: {
+				type: "plain_text",
+				text: "Approval required",
+				emoji: true,
+			},
+		},
 		{
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: `*Approval required:* ${label}`,
+				text: `*${title}*`,
 			},
 		},
-		{
-			type: "actions",
-			elements: [
-				{
-					type: "button",
-					text: { type: "plain_text", text: "Approve", emoji: true },
-					style: "primary",
-					action_id: "mom_approve",
-					value: JSON.stringify({ toolCallId, channelId }),
-				},
-				{
-					type: "button",
-					text: { type: "plain_text", text: "Reject", emoji: true },
-					style: "danger",
-					action_id: "mom_reject",
-					value: JSON.stringify({ toolCallId, channelId }),
-				},
-			],
-		},
 	];
-	if (instruction) {
-		blocks.splice(1, 0, {
+	if (descriptionText) {
+		blocks.push({
 			type: "context",
-			elements: [{ type: "mrkdwn", text: instruction }],
+			elements: [{ type: "mrkdwn", text: descriptionText }],
 		});
 	}
+	if (approvalDisplay?.fields.length) {
+		blocks.push({
+			type: "section",
+			fields: approvalDisplay.fields.slice(0, 10).map((field) => ({
+				type: "mrkdwn" as const,
+				text: formatApprovalFieldText(field),
+			})),
+		});
+	}
+	blocks.push({
+		type: "actions",
+		elements: [
+			{
+				type: "button",
+				text: { type: "plain_text", text: "Approve", emoji: true },
+				style: "primary",
+				action_id: "mom_approve",
+				value: JSON.stringify({ toolCallId, conversationId }),
+			},
+			{
+				type: "button",
+				text: { type: "plain_text", text: "Reject", emoji: true },
+				style: "danger",
+				action_id: "mom_reject",
+				value: JSON.stringify({ toolCallId, conversationId }),
+			},
+		],
+	});
 	return blocks;
 }
 
@@ -147,21 +231,143 @@ export function buildResolvedApprovalMessage(
 	label: string,
 	approved: boolean,
 	resolvedBy?: string,
+	approvalDisplay?: ApprovalSummary,
 ): { text: string; blocks: KnownBlock[] } {
 	const status = approved ? "✅ Approved" : "❌ Rejected";
 	const byText = resolvedBy ? ` by <@${resolvedBy}>` : "";
-	return {
-		text: `${status}: ${label}${byText}`,
-		blocks: [
-			{
-				type: "section",
-				text: {
-					type: "mrkdwn",
-					text: `${status}: *${label}*${byText}`,
-				},
+	const title = approvalDisplay?.title || approvalDisplay?.toolName || label;
+	const descriptionText = getApprovalDescriptionText(approvalDisplay);
+	const blocks: KnownBlock[] = [
+		{
+			type: "header",
+			text: {
+				type: "plain_text",
+				text: "Approval resolved",
+				emoji: true,
 			},
-		],
+		},
+		{
+			type: "section",
+			text: {
+				type: "mrkdwn",
+				text: `${status}: *${title}*${byText}`,
+			},
+		},
+	];
+	if (descriptionText) {
+		blocks.push({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: descriptionText }],
+		});
+	}
+	if (approvalDisplay?.fields.length) {
+		blocks.push({
+			type: "section",
+			fields: approvalDisplay.fields.slice(0, 10).map((field) => ({
+				type: "mrkdwn" as const,
+				text: formatApprovalFieldText(field),
+			})),
+		});
+	}
+	return {
+		text: `${status}: ${title}${byText}`,
+		blocks,
 	};
+}
+
+function truncateAssistantMessage(text: string): string {
+	const normalized = text.replace(/\s+/g, " ").trim();
+	if (normalized.length <= MAX_ASSISTANT_MESSAGE_LENGTH) {
+		return normalized;
+	}
+	return `${normalized.slice(0, MAX_ASSISTANT_MESSAGE_LENGTH - 3).trimEnd()}...`;
+}
+
+export function buildAssistantStatusText(entries: ToolTimelineEntry[], idleLabel?: string): string {
+	if (entries.length === 0) {
+		return idleLabel ? truncateAssistantMessage(`⏳ Handling ${idleLabel}...`) : "💭 Thinking...";
+	}
+
+	const entry = entries.at(-1)!;
+	let message: string;
+	switch (entry.status) {
+		case "success":
+			message = `✅ Completed ${entry.label}`;
+			break;
+		case "error":
+			message = `❌ Failed ${entry.label}`;
+			break;
+		case "paused":
+			message = `⏸ Waiting for approval on ${entry.label}`;
+			break;
+		default:
+			message = `⏳ Working on ${entry.label}`;
+			break;
+	}
+	return truncateAssistantMessage(message);
+}
+
+function buildToolTimelineText(status: RunStatusKind, entries: ToolTimelineEntry[]): string {
+	if (entries.length === 0) {
+		switch (status) {
+			case "approval_pending":
+				return ":pause_button: Awaiting approval";
+			case "done":
+				return ":white_check_mark: Done";
+			case "failed":
+				return ":x: Failed";
+			case "stopped":
+				return ":stop_sign: Stopped";
+			default:
+				return ":thought_balloon: Thinking";
+		}
+	}
+
+	return entries
+		.map((entry) => {
+			switch (entry.status) {
+				case "success":
+					return `:white_check_mark: ${entry.label}`;
+				case "error":
+					return `:x: ${entry.label}`;
+				case "paused":
+					return `:pause_button: ${entry.label}`;
+				default:
+					return `:hourglass_flowing_sand: ${entry.label}`;
+			}
+		})
+		.join("\n");
+}
+
+export function buildToolTimelineBlocks(status: RunStatusKind, entries: ToolTimelineEntry[]): KnownBlock[] {
+	const headerText =
+		status === "approval_pending"
+			? "Waiting for approval"
+			: status === "done"
+				? "Done"
+				: status === "failed"
+					? "Failed"
+					: status === "stopped"
+						? "Stopped"
+						: "Working on it";
+
+	return [
+		{
+			type: "header",
+			text: {
+				type: "plain_text",
+				text: headerText,
+				emoji: true,
+			},
+		},
+		{
+			type: "section",
+			text: {
+				type: "mrkdwn",
+				text: buildToolTimelineText(status, entries),
+			},
+		},
+	];
 }
 
 // ============================================================================
@@ -213,6 +419,7 @@ export class SlackBot {
 	private users = new Map<string, SlackUser>();
 	private channels = new Map<string, SlackChannel>();
 	private queues = new Map<string, ChannelQueue>();
+	private assistantStatusUnsupported = false;
 
 	constructor(
 		handler: MomHandler,
@@ -263,13 +470,116 @@ export class SlackBot {
 		return Array.from(this.channels.values());
 	}
 
-	async postMessage(channel: string, text: string): Promise<string> {
-		const result = await this.webClient.chat.postMessage({ channel, text });
+	async postMessage(channel: string, text: string, threadTs?: string): Promise<string> {
+		const result = await this.webClient.chat.postMessage({ channel, text, thread_ts: threadTs });
 		return result.ts as string;
 	}
 
 	async updateMessage(channel: string, ts: string, text: string): Promise<void> {
 		await this.webClient.chat.update({ channel, ts, text });
+	}
+
+	async postToolTimeline(
+		channel: string,
+		status: RunStatusKind,
+		entries: ToolTimelineEntry[],
+		threadTs?: string,
+	): Promise<string> {
+		const blocks = buildToolTimelineBlocks(status, entries);
+		const text = buildToolTimelineText(status, entries);
+		const result = await this.webClient.chat.postMessage({
+			channel,
+			text,
+			blocks,
+			thread_ts: threadTs,
+		});
+		return result.ts as string;
+	}
+
+	async updateToolTimeline(
+		channel: string,
+		ts: string,
+		status: RunStatusKind,
+		entries: ToolTimelineEntry[],
+	): Promise<void> {
+		const blocks = buildToolTimelineBlocks(status, entries);
+		const text = buildToolTimelineText(status, entries);
+		await this.webClient.chat.update({
+			channel,
+			ts,
+			text,
+			blocks,
+		});
+	}
+
+	async setAssistantThreadStatus(
+		channel: string,
+		threadTs: string,
+		statusText: string,
+	): Promise<AssistantThreadStatusResult> {
+		if (this.assistantStatusUnsupported) {
+			return "unsupported";
+		}
+
+		try {
+			await this.webClient.assistant.threads.setStatus({
+				channel_id: channel,
+				thread_ts: threadTs,
+				status: statusText,
+			});
+			return "updated";
+		} catch (error) {
+			if (
+				error &&
+				typeof error === "object" &&
+				"code" in error &&
+				error.code === ErrorCode.PlatformError &&
+				"data" in error
+			) {
+				const platformError = error as WebAPIPlatformError;
+				if (UNSUPPORTED_ASSISTANT_STATUS_ERRORS.has(platformError.data.error ?? "")) {
+					this.assistantStatusUnsupported = true;
+					log.logWarning(
+						"Slack assistant status unavailable",
+						platformError.data.error ?? "unsupported assistant status API",
+					);
+					return "unsupported";
+				}
+			}
+
+			log.logWarning("Slack assistant status error", error instanceof Error ? error.message : String(error));
+			return "failed";
+		}
+	}
+
+	async clearAssistantThreadStatus(channel: string, threadTs: string): Promise<void> {
+		if (this.assistantStatusUnsupported) {
+			return;
+		}
+
+		try {
+			await this.webClient.assistant.threads.setStatus({
+				channel_id: channel,
+				thread_ts: threadTs,
+				status: "",
+			});
+		} catch (error) {
+			if (
+				error &&
+				typeof error === "object" &&
+				"code" in error &&
+				error.code === ErrorCode.PlatformError &&
+				"data" in error
+			) {
+				const platformError = error as WebAPIPlatformError;
+				if (UNSUPPORTED_ASSISTANT_STATUS_ERRORS.has(platformError.data.error ?? "")) {
+					this.assistantStatusUnsupported = true;
+					return;
+				}
+			}
+
+			log.logWarning("Slack clear assistant status error", error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	async deleteMessage(channel: string, ts: string): Promise<void> {
@@ -281,9 +591,19 @@ export class SlackBot {
 		return result.ts as string;
 	}
 
-	async uploadFile(channel: string, filePath: string, title?: string): Promise<void> {
+	async uploadFile(channel: string, filePath: string, title?: string, threadTs?: string): Promise<void> {
 		const fileName = title || basename(filePath);
 		const fileContent = readFileSync(filePath);
+		if (threadTs) {
+			await this.webClient.files.uploadV2({
+				channels: channel,
+				thread_ts: threadTs,
+				file: fileContent,
+				filename: fileName,
+				title: fileName,
+			});
+			return;
+		}
 		await this.webClient.files.uploadV2({
 			channel_id: channel,
 			file: fileContent,
@@ -296,13 +616,23 @@ export class SlackBot {
 	 * Post a Block Kit approval widget with approve/reject buttons.
 	 * Returns the message ts.
 	 */
-	async postApprovalWidget(channel: string, toolCallId: string, label: string, instruction?: string): Promise<string> {
-		const blocks = buildApprovalWidgetBlocks(channel, toolCallId, label, instruction);
+	async postApprovalWidget(
+		channel: string,
+		conversationId: string,
+		toolCallId: string,
+		label: string,
+		instruction?: string,
+		approvalDisplay?: ApprovalSummary,
+		threadTs?: string,
+	): Promise<string> {
+		const blocks = buildApprovalWidgetBlocks(conversationId, toolCallId, label, instruction, approvalDisplay);
+		const text = approvalDisplay?.title || approvalDisplay?.toolName || label;
 
 		const result = await this.webClient.chat.postMessage({
 			channel,
-			text: `Approval required: ${label}`,
+			text: `Approval required: ${text}`,
 			blocks,
+			thread_ts: threadTs,
 		});
 		return result.ts as string;
 	}
@@ -316,8 +646,9 @@ export class SlackBot {
 		label: string,
 		approved: boolean,
 		resolvedBy?: string,
+		approvalDisplay?: ApprovalSummary,
 	): Promise<void> {
-		const resolved = buildResolvedApprovalMessage(label, approved, resolvedBy);
+		const resolved = buildResolvedApprovalMessage(label, approved, resolvedBy, approvalDisplay);
 		await this.webClient.chat.update({
 			channel,
 			ts: messageTs,
@@ -330,8 +661,8 @@ export class SlackBot {
 	 * Log a message to log.jsonl (SYNC)
 	 * This is the ONLY place messages are written to log.jsonl
 	 */
-	logToFile(channel: string, entry: object): void {
-		const dir = join(this.workingDir, channel);
+	logToFile(conversationId: string, entry: object): void {
+		const dir = join(this.workingDir, conversationId);
 		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 		appendFileSync(join(dir, "log.jsonl"), `${JSON.stringify(entry)}\n`);
 	}
@@ -339,14 +670,15 @@ export class SlackBot {
 	/**
 	 * Log a bot response to log.jsonl
 	 */
-	logBotResponse(channel: string, text: string, ts: string): void {
-		this.logToFile(channel, {
+	logBotResponse(conversationId: string, text: string, ts: string, threadTs?: string): void {
+		this.logToFile(conversationId, {
 			date: new Date().toISOString(),
 			ts,
 			user: "bot",
 			text,
 			attachments: [],
 			isBot: true,
+			threadTs,
 		});
 	}
 
@@ -359,12 +691,12 @@ export class SlackBot {
 	 * Returns true if enqueued, false if queue is full (max 5).
 	 */
 	enqueueEvent(event: SlackEvent): boolean {
-		const queue = this.getQueue(event.channel);
+		const queue = this.getQueue(event.conversationId);
 		if (queue.size() >= 5) {
-			log.logWarning(`Event queue full for ${event.channel}, discarding: ${event.text.substring(0, 50)}`);
+			log.logWarning(`Event queue full for ${event.conversationId}, discarding: ${event.text.substring(0, 50)}`);
 			return false;
 		}
-		log.logInfo(`Enqueueing event for ${event.channel}: ${event.text.substring(0, 50)}`);
+		log.logInfo(`Enqueueing event for ${event.conversationId}: ${event.text.substring(0, 50)}`);
 		queue.enqueue(() => this.handler.handleEvent(event, this, true));
 		return true;
 	}
@@ -373,11 +705,11 @@ export class SlackBot {
 	// Private - Event Handlers
 	// ==========================================================================
 
-	private getQueue(channelId: string): ChannelQueue {
-		let queue = this.queues.get(channelId);
+	private getQueue(conversationId: string): ChannelQueue {
+		let queue = this.queues.get(conversationId);
 		if (!queue) {
 			queue = new ChannelQueue();
-			this.queues.set(channelId, queue);
+			this.queues.set(conversationId, queue);
 		}
 		return queue;
 	}
@@ -400,7 +732,7 @@ export class SlackBot {
 			const action = actions[0];
 			if (action.action_id !== "mom_approve" && action.action_id !== "mom_reject") return;
 
-			let parsed: { toolCallId: string; channelId: string };
+			let parsed: { toolCallId: string; conversationId?: string };
 			try {
 				parsed = JSON.parse(action.value || "{}");
 			} catch {
@@ -410,12 +742,12 @@ export class SlackBot {
 
 			const userId = (body.user as { id?: string })?.id || "unknown";
 			const messageTs = (body.message as { ts?: string })?.ts || "";
-			const channel = (body.channel as { id?: string })?.id || parsed.channelId;
+			const channel = (body.channel as { id?: string })?.id || "";
 
 			const approvalAction: ApprovalAction = {
 				actionId: action.action_id as "mom_approve" | "mom_reject",
 				toolCallId: parsed.toolCallId,
-				channelId: channel,
+				conversationId: parsed.conversationId || channel,
 				userId,
 				messageTs,
 			};
@@ -434,6 +766,7 @@ export class SlackBot {
 				channel: string;
 				user: string;
 				ts: string;
+				thread_ts?: string;
 				files?: Array<{ name: string; url_private_download?: string; url_private?: string }>;
 			};
 
@@ -443,10 +776,18 @@ export class SlackBot {
 				return;
 			}
 
+			const conversation = buildConversationInfo({
+				channelId: e.channel,
+				ts: e.ts,
+				threadTs: e.thread_ts,
+				isDm: false,
+			});
 			const slackEvent: SlackEvent = {
 				type: "mention",
+				conversationId: conversation.conversationId,
 				channel: e.channel,
 				ts: e.ts,
+				threadTs: conversation.threadTs,
 				user: e.user,
 				text: e.text.replace(/<@[A-Z0-9]+>/gi, "").trim(),
 				files: e.files,
@@ -467,20 +808,20 @@ export class SlackBot {
 
 			// Check for stop command - execute immediately, don't queue!
 			if (slackEvent.text.toLowerCase().trim() === "stop") {
-				if (this.handler.isRunning(e.channel)) {
-					this.handler.handleStop(e.channel, this); // Don't await, don't queue
+				if (this.handler.isRunning(slackEvent.conversationId)) {
+					this.handler.handleStop(slackEvent, this); // Don't await, don't queue
 				} else {
-					this.postMessage(e.channel, "_Nothing running_");
+					this.postMessage(e.channel, "_Nothing running_", slackEvent.threadTs);
 				}
 				ack();
 				return;
 			}
 
 			// SYNC: Check if busy
-			if (this.handler.isRunning(e.channel)) {
-				this.postMessage(e.channel, "_Already working. Say `@mom stop` to cancel._");
+			if (this.handler.isRunning(slackEvent.conversationId)) {
+				this.postMessage(e.channel, "_Already working. Say `@mom stop` to cancel._", slackEvent.threadTs);
 			} else {
-				this.getQueue(e.channel).enqueue(() => this.handler.handleEvent(slackEvent, this));
+				this.getQueue(slackEvent.conversationId).enqueue(() => this.handler.handleEvent(slackEvent, this));
 			}
 
 			ack();
@@ -493,6 +834,7 @@ export class SlackBot {
 				channel: string;
 				user?: string;
 				ts: string;
+				thread_ts?: string;
 				channel_type?: string;
 				subtype?: string;
 				bot_id?: string;
@@ -522,14 +864,28 @@ export class SlackBot {
 				return;
 			}
 
+			const conversation = buildConversationInfo({
+				channelId: e.channel,
+				ts: e.ts,
+				threadTs: e.thread_ts,
+				isDm: isDM,
+			});
 			const slackEvent: SlackEvent = {
 				type: isDM ? "dm" : "mention",
+				conversationId: conversation.conversationId,
 				channel: e.channel,
 				ts: e.ts,
+				threadTs: conversation.threadTs,
 				user: e.user,
 				text: (e.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim(),
 				files: e.files,
 			};
+
+			// Ignore non-DM non-thread chatter; only thread conversations are persisted in channels.
+			if (!isDM && !slackEvent.threadTs) {
+				ack();
+				return;
+			}
 
 			// SYNC: Log to log.jsonl (ALL messages - channel chatter and DMs)
 			// Also downloads attachments in background and stores local paths
@@ -542,23 +898,22 @@ export class SlackBot {
 				return;
 			}
 
-			// Only trigger handler for DMs
-			if (isDM) {
-				// Check for stop command - execute immediately, don't queue!
-				if (slackEvent.text.toLowerCase().trim() === "stop") {
-					if (this.handler.isRunning(e.channel)) {
-						this.handler.handleStop(e.channel, this); // Don't await, don't queue
-					} else {
-						this.postMessage(e.channel, "_Nothing running_");
-					}
-					ack();
-					return;
+			if (slackEvent.text.toLowerCase().trim() === "stop") {
+				if (this.handler.isRunning(slackEvent.conversationId)) {
+					this.handler.handleStop(slackEvent, this); // Don't await, don't queue
+				} else {
+					this.postMessage(e.channel, "_Nothing running_", isDM ? undefined : slackEvent.threadTs);
 				}
+				ack();
+				return;
+			}
 
-				if (this.handler.isRunning(e.channel)) {
+			// Only trigger handler for DMs. Thread replies are context only unless they explicitly mention via app_mention.
+			if (isDM) {
+				if (this.handler.isRunning(slackEvent.conversationId)) {
 					this.postMessage(e.channel, "_Already working. Say `stop` to cancel._");
 				} else {
-					this.getQueue(e.channel).enqueue(() => this.handler.handleEvent(slackEvent, this));
+					this.getQueue(slackEvent.conversationId).enqueue(() => this.handler.handleEvent(slackEvent, this));
 				}
 			}
 
@@ -573,8 +928,8 @@ export class SlackBot {
 	private logUserMessage(event: SlackEvent): Attachment[] {
 		const user = this.users.get(event.user);
 		// Process attachments - queues downloads in background
-		const attachments = event.files ? this.store.processAttachments(event.channel, event.files, event.ts) : [];
-		this.logToFile(event.channel, {
+		const attachments = event.files ? this.store.processAttachments(event.conversationId, event.files, event.ts) : [];
+		this.logToFile(event.conversationId, {
 			date: new Date(parseFloat(event.ts) * 1000).toISOString(),
 			ts: event.ts,
 			user: event.user,
@@ -583,6 +938,8 @@ export class SlackBot {
 			text: event.text,
 			attachments,
 			isBot: false,
+			channelId: event.channel,
+			threadTs: event.threadTs,
 		});
 		return attachments;
 	}
@@ -591,8 +948,8 @@ export class SlackBot {
 	// Private - Backfill
 	// ==========================================================================
 
-	private getExistingTimestamps(channelId: string): Set<string> {
-		const logPath = join(this.workingDir, channelId, "log.jsonl");
+	private getExistingTimestamps(conversationId: string): Set<string> {
+		const logPath = join(this.workingDir, conversationId, "log.jsonl");
 		const timestamps = new Set<string>();
 		if (!existsSync(logPath)) return timestamps;
 
@@ -607,8 +964,9 @@ export class SlackBot {
 		return timestamps;
 	}
 
-	private async backfillChannel(channelId: string): Promise<number> {
-		const existingTs = this.getExistingTimestamps(channelId);
+	private async backfillThreadConversation(conversation: ConversationInfo): Promise<number> {
+		if (!conversation.threadTs) return 0;
+		const existingTs = this.getExistingTimestamps(conversation.conversationId);
 
 		// Find the biggest ts in log.jsonl
 		let latestTs: string | undefined;
@@ -621,6 +979,7 @@ export class SlackBot {
 			bot_id?: string;
 			text?: string;
 			ts?: string;
+			thread_ts?: string;
 			subtype?: string;
 			files?: Array<{ name: string }>;
 		};
@@ -631,11 +990,12 @@ export class SlackBot {
 		const maxPages = 3;
 
 		do {
-			const result = await this.webClient.conversations.history({
-				channel: channelId,
+			const result = await this.webClient.conversations.replies({
+				channel: conversation.slackChannelId,
+				ts: conversation.threadTs,
 				oldest: latestTs, // Only fetch messages newer than what we have
 				inclusive: false,
-				limit: 1000,
+				limit: 200,
 				cursor,
 			});
 			if (result.messages) {
@@ -666,6 +1026,80 @@ export class SlackBot {
 			// Strip @mentions from text (same as live messages)
 			const text = (msg.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim();
 			// Process attachments - queues downloads in background
+			const attachments = msg.files
+				? this.store.processAttachments(conversation.conversationId, msg.files, msg.ts!)
+				: [];
+
+			this.logToFile(conversation.conversationId, {
+				date: new Date(parseFloat(msg.ts!) * 1000).toISOString(),
+				ts: msg.ts!,
+				user: isMomMessage ? "bot" : msg.user!,
+				userName: isMomMessage ? undefined : user?.userName,
+				displayName: isMomMessage ? undefined : user?.displayName,
+				text,
+				attachments,
+				isBot: isMomMessage,
+				channelId: conversation.slackChannelId,
+				threadTs: conversation.threadTs,
+			});
+		}
+
+		return relevantMessages.length;
+	}
+
+	private async backfillDmConversation(channelId: string): Promise<number> {
+		const existingTs = this.getExistingTimestamps(channelId);
+
+		let latestTs: string | undefined;
+		for (const ts of existingTs) {
+			if (!latestTs || parseFloat(ts) > parseFloat(latestTs)) latestTs = ts;
+		}
+
+		type Message = {
+			user?: string;
+			bot_id?: string;
+			text?: string;
+			ts?: string;
+			subtype?: string;
+			files?: Array<{ name: string }>;
+		};
+		const allMessages: Message[] = [];
+
+		let cursor: string | undefined;
+		let pageCount = 0;
+		const maxPages = 3;
+
+		do {
+			const result = await this.webClient.conversations.history({
+				channel: channelId,
+				oldest: latestTs,
+				inclusive: false,
+				limit: 1000,
+				cursor,
+			});
+			if (result.messages) {
+				allMessages.push(...(result.messages as Message[]));
+			}
+			cursor = result.response_metadata?.next_cursor;
+			pageCount++;
+		} while (cursor && pageCount < maxPages);
+
+		const relevantMessages = allMessages.filter((msg) => {
+			if (!msg.ts || existingTs.has(msg.ts)) return false;
+			if (msg.user === this.botUserId) return true;
+			if (msg.bot_id) return false;
+			if (msg.subtype !== undefined && msg.subtype !== "file_share") return false;
+			if (!msg.user) return false;
+			if (!msg.text && (!msg.files || msg.files.length === 0)) return false;
+			return true;
+		});
+
+		relevantMessages.reverse();
+
+		for (const msg of relevantMessages) {
+			const isMomMessage = msg.user === this.botUserId;
+			const user = this.users.get(msg.user!);
+			const text = (msg.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim();
 			const attachments = msg.files ? this.store.processAttachments(channelId, msg.files, msg.ts!) : [];
 
 			this.logToFile(channelId, {
@@ -677,6 +1111,7 @@ export class SlackBot {
 				text,
 				attachments,
 				isBot: isMomMessage,
+				channelId,
 			});
 		}
 
@@ -686,25 +1121,34 @@ export class SlackBot {
 	private async backfillAllChannels(): Promise<void> {
 		const startTime = Date.now();
 
-		// Only backfill channels that already have a log.jsonl (mom has interacted with them before)
-		const channelsToBackfill: Array<[string, SlackChannel]> = [];
-		for (const [channelId, channel] of this.channels) {
-			const logPath = join(this.workingDir, channelId, "log.jsonl");
-			if (existsSync(logPath)) {
-				channelsToBackfill.push([channelId, channel]);
+		// Only backfill conversations that already have a log.jsonl.
+		const conversationsToBackfill: ConversationInfo[] = [];
+		for (const entry of readdirSync(this.workingDir, { withFileTypes: true })) {
+			if (!entry.isDirectory()) continue;
+			if (entry.name === "skills" || entry.name === "events") continue;
+			const logPath = join(this.workingDir, entry.name, "log.jsonl");
+			if (!existsSync(logPath)) continue;
+			try {
+				conversationsToBackfill.push(parseConversationId(entry.name));
+			} catch {
+				// Ignore unrelated directories and legacy channel-only sessions
 			}
 		}
 
-		log.logBackfillStart(channelsToBackfill.length);
+		log.logBackfillStart(conversationsToBackfill.length);
 
 		let totalMessages = 0;
-		for (const [channelId, channel] of channelsToBackfill) {
+		for (const conversation of conversationsToBackfill) {
 			try {
-				const count = await this.backfillChannel(channelId);
-				if (count > 0) log.logBackfillChannel(channel.name, count);
+				const count = conversation.isDm
+					? await this.backfillDmConversation(conversation.slackChannelId)
+					: await this.backfillThreadConversation(conversation);
+				const channelName = this.channels.get(conversation.slackChannelId)?.name ?? conversation.slackChannelId;
+				const label = conversation.threadTs ? `${channelName}:${conversation.threadTs}` : channelName;
+				if (count > 0) log.logBackfillChannel(label, count);
 				totalMessages += count;
 			} catch (error) {
-				log.logWarning(`Failed to backfill #${channel.name}`, String(error));
+				log.logWarning(`Failed to backfill ${conversation.conversationId}`, String(error));
 			}
 		}
 

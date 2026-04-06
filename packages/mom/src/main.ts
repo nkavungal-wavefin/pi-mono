@@ -10,10 +10,13 @@ import * as log from "./log.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
 import {
 	type ApprovalAction,
+	buildAssistantStatusText,
 	type MomHandler,
+	type RunStatusKind,
 	type SlackBot,
 	SlackBot as SlackBotClass,
 	type SlackEvent,
+	type ToolTimelineEntry,
 } from "./slack.js";
 import { ChannelStore } from "./store.js";
 import { resumeExecutorExecution } from "./tools/executor.js";
@@ -88,42 +91,49 @@ if (!MOM_SLACK_APP_TOKEN || !MOM_SLACK_BOT_TOKEN) {
 await validateSandbox(sandbox);
 
 // ============================================================================
-// State (per channel)
+// State (per conversation)
 // ============================================================================
 
-interface ChannelState {
+interface ConversationState {
 	running: boolean;
 	runner: AgentRunner;
 	store: ChannelStore;
 	stopRequested: boolean;
 	stopMessageTs?: string;
+	statusCardTs?: string;
+	statusCardState?: RunStatusKind;
+	toolTimeline: ToolTimelineEntry[];
 	approvalCallbackWired: boolean;
 }
 
-const channelStates = new Map<string, ChannelState>();
+const conversationStates = new Map<string, ConversationState>();
 
-function getState(channelId: string, slack?: SlackBot): ChannelState {
-	let state = channelStates.get(channelId);
+function getState(conversationId: string, slack?: SlackBot): ConversationState {
+	let state = conversationStates.get(conversationId);
 	if (!state) {
-		const channelDir = join(workingDir, channelId);
+		const channelDir = join(workingDir, conversationId);
 		state = {
 			running: false,
-			runner: getOrCreateRunner(sandbox, channelId, channelDir),
+			runner: getOrCreateRunner(sandbox, conversationId, channelDir),
 			store: new ChannelStore({ workingDir, botToken: MOM_SLACK_BOT_TOKEN! }),
 			stopRequested: false,
+			toolTimeline: [],
 			approvalCallbackWired: false,
 		};
-		channelStates.set(channelId, state);
+		conversationStates.set(conversationId, state);
 	}
 	// Wire approval callback once we have a slack reference
 	if (slack && !state.approvalCallbackWired) {
 		state.runner.setApprovalCallback(async (approval: PendingApproval) => {
 			try {
 				const ts = await slack.postApprovalWidget(
+					approval.slackChannelId ?? approval.channelId,
 					approval.channelId,
 					approval.toolCallId,
 					approval.label,
 					approval.instruction,
+					approval.approvalDisplay,
+					approval.threadTs,
 				);
 				approval.approvalMessageTs = ts;
 				updateApproval(workingDir, approval);
@@ -140,18 +150,63 @@ function getState(channelId: string, slack?: SlackBot): ChannelState {
 // Create SlackContext adapter
 // ============================================================================
 
-function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelState, isEvent?: boolean) {
-	let messageTs: string | null = null;
+function createSlackContext(event: SlackEvent, slack: SlackBot, state: ConversationState, isEvent?: boolean) {
+	let responseMessageTs: string | null = null;
+	let statusMessageTs: string | null = state.statusCardTs ?? null;
 	const threadMessageTs: string[] = [];
 	let accumulatedText = "";
-	let isWorking = true;
-	const workingIndicator = " ...";
 	let updatePromise = Promise.resolve();
+	let progressSurface: "assistant" | "card" | null = null;
 
 	const user = slack.getUser(event.user);
+	const assistantThreadTs = event.threadTs ?? event.ts;
 
 	// Extract event filename for status message
 	const eventFilename = isEvent ? event.text.match(/^\[EVENT:([^:]+):/)?.[1] : undefined;
+
+	const syncStatusCard = async (status: RunStatusKind, entries: ToolTimelineEntry[]) => {
+		state.statusCardState = status;
+		state.toolTimeline = [...entries];
+		if (status === "working") {
+			const assistantStatus = await slack.setAssistantThreadStatus(
+				event.channel,
+				assistantThreadTs,
+				buildAssistantStatusText(entries, eventFilename),
+			);
+			if (assistantStatus === "updated") {
+				if (progressSurface === "card" && statusMessageTs) {
+					await slack.deleteMessage(event.channel, statusMessageTs);
+					statusMessageTs = null;
+					state.statusCardTs = undefined;
+				}
+				progressSurface = "assistant";
+				return;
+			}
+
+			if (assistantStatus === "failed") {
+				if (progressSurface === "assistant") {
+					return;
+				}
+				return;
+			}
+
+			progressSurface = "card";
+		} else if (progressSurface === "assistant") {
+			await slack.clearAssistantThreadStatus(event.channel, assistantThreadTs);
+			progressSurface = null;
+			return;
+		} else if (!statusMessageTs) {
+			return;
+		}
+
+		if (statusMessageTs) {
+			await slack.updateToolTimeline(event.channel, statusMessageTs, status, state.toolTimeline);
+			return;
+		}
+		progressSurface = "card";
+		statusMessageTs = await slack.postToolTimeline(event.channel, status, state.toolTimeline, event.threadTs);
+		state.statusCardTs = statusMessageTs;
+	};
 
 	return {
 		message: {
@@ -159,8 +214,10 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 			rawText: event.text,
 			user: event.user,
 			userName: user?.userName,
+			conversationId: event.conversationId,
 			channel: event.channel,
 			ts: event.ts,
+			threadTs: event.threadTs,
 			attachments: (event.attachments || []).map((a) => ({ local: a.local })),
 		},
 		channelName: slack.getChannel(event.channel)?.name,
@@ -181,16 +238,16 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 							accumulatedText.substring(0, MAX_MAIN_LENGTH - truncationNote.length) + truncationNote;
 					}
 
-					const displayText = isWorking ? accumulatedText + workingIndicator : accumulatedText;
+					const displayText = accumulatedText;
 
-					if (messageTs) {
-						await slack.updateMessage(event.channel, messageTs, displayText);
+					if (responseMessageTs) {
+						await slack.updateMessage(event.channel, responseMessageTs, displayText);
 					} else {
-						messageTs = await slack.postMessage(event.channel, displayText);
+						responseMessageTs = await slack.postMessage(event.channel, displayText, event.threadTs);
 					}
 
-					if (shouldLog && messageTs) {
-						slack.logBotResponse(event.channel, text, messageTs);
+					if (shouldLog && responseMessageTs) {
+						slack.logBotResponse(event.conversationId, text, responseMessageTs, event.threadTs);
 					}
 				} catch (err) {
 					log.logWarning("Slack respond error", err instanceof Error ? err.message : String(err));
@@ -211,12 +268,12 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 						accumulatedText = text;
 					}
 
-					const displayText = isWorking ? accumulatedText + workingIndicator : accumulatedText;
+					const displayText = accumulatedText;
 
-					if (messageTs) {
-						await slack.updateMessage(event.channel, messageTs, displayText);
+					if (responseMessageTs) {
+						await slack.updateMessage(event.channel, responseMessageTs, displayText);
 					} else {
-						messageTs = await slack.postMessage(event.channel, displayText);
+						responseMessageTs = await slack.postMessage(event.channel, displayText, event.threadTs);
 					}
 				} catch (err) {
 					log.logWarning("Slack replaceMessage error", err instanceof Error ? err.message : String(err));
@@ -225,10 +282,16 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 			await updatePromise;
 		},
 
+		setToolTimelineStatus: async (status: RunStatusKind, entries: ToolTimelineEntry[]) => {
+			updatePromise = updatePromise.then(() => syncStatusCard(status, entries));
+			await updatePromise;
+		},
+
 		respondInThread: async (text: string) => {
 			updatePromise = updatePromise.then(async () => {
 				try {
-					if (messageTs) {
+					const parentTs = event.threadTs ?? responseMessageTs;
+					if (parentTs) {
 						// Truncate thread messages if too long (20K limit for safety)
 						const MAX_THREAD_LENGTH = 20000;
 						let threadText = text;
@@ -236,7 +299,7 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 							threadText = `${threadText.substring(0, MAX_THREAD_LENGTH - 50)}\n\n_(truncated)_`;
 						}
 
-						const ts = await slack.postInThread(event.channel, messageTs, threadText);
+						const ts = await slack.postInThread(event.channel, parentTs, threadText);
 						threadMessageTs.push(ts);
 					}
 				} catch (err) {
@@ -247,13 +310,16 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 		},
 
 		setTyping: async (isTyping: boolean) => {
-			if (isTyping && !messageTs) {
+			if (isTyping) {
 				updatePromise = updatePromise.then(async () => {
 					try {
-						if (!messageTs) {
-							accumulatedText = eventFilename ? `_Starting event: ${eventFilename}_` : "_Thinking_";
-							messageTs = await slack.postMessage(event.channel, accumulatedText + workingIndicator);
-						}
+						const thinkingTimeline =
+							state.toolTimeline.length > 0
+								? state.toolTimeline
+								: eventFilename
+									? [{ label: `event:${eventFilename}`, status: "in_progress" as const }]
+									: [];
+						await syncStatusCard("working", thinkingTimeline);
 					} catch (err) {
 						log.logWarning("Slack setTyping error", err instanceof Error ? err.message : String(err));
 					}
@@ -263,17 +329,13 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 		},
 
 		uploadFile: async (filePath: string, title?: string) => {
-			await slack.uploadFile(event.channel, filePath, title);
+			await slack.uploadFile(event.channel, filePath, title, event.threadTs);
 		},
 
 		setWorking: async (working: boolean) => {
 			updatePromise = updatePromise.then(async () => {
 				try {
-					isWorking = working;
-					if (messageTs) {
-						const displayText = isWorking ? accumulatedText + workingIndicator : accumulatedText;
-						await slack.updateMessage(event.channel, messageTs, displayText);
-					}
+					void working;
 				} catch (err) {
 					log.logWarning("Slack setWorking error", err instanceof Error ? err.message : String(err));
 				}
@@ -293,9 +355,9 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 				}
 				threadMessageTs.length = 0;
 				// Then delete main message
-				if (messageTs) {
-					await slack.deleteMessage(event.channel, messageTs);
-					messageTs = null;
+				if (responseMessageTs) {
+					await slack.deleteMessage(event.channel, responseMessageTs);
+					responseMessageTs = null;
 				}
 			});
 			await updatePromise;
@@ -308,31 +370,34 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 // ============================================================================
 
 const handler: MomHandler = {
-	isRunning(channelId: string): boolean {
-		const state = channelStates.get(channelId);
+	isRunning(conversationId: string): boolean {
+		const state = conversationStates.get(conversationId);
 		return state?.running ?? false;
 	},
 
-	async handleStop(channelId: string, slack: SlackBot): Promise<void> {
-		const state = channelStates.get(channelId);
+	async handleStop(event: SlackEvent, slack: SlackBot): Promise<void> {
+		const state = conversationStates.get(event.conversationId);
 		if (state?.running) {
 			state.stopRequested = true;
 			state.runner.abort();
-			const ts = await slack.postMessage(channelId, "_Stopping..._");
+			const ts = await slack.postMessage(event.channel, "_Stopping..._", event.threadTs);
 			state.stopMessageTs = ts; // Save for updating later
 		} else {
-			await slack.postMessage(channelId, "_Nothing running_");
+			await slack.postMessage(event.channel, "_Nothing running_", event.threadTs);
 		}
 	},
 
 	async handleEvent(event: SlackEvent, slack: SlackBot, isEvent?: boolean): Promise<void> {
-		const state = getState(event.channel, slack);
+		const state = getState(event.conversationId, slack);
 
 		// Start run
 		state.running = true;
 		state.stopRequested = false;
+		state.statusCardTs = undefined;
+		state.statusCardState = undefined;
+		state.toolTimeline = [];
 
-		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
+		log.logInfo(`[${event.conversationId}] Starting run: ${event.text.substring(0, 50)}`);
 
 		try {
 			// Create context adapter
@@ -345,43 +410,57 @@ const handler: MomHandler = {
 			await ctx.setWorking(false);
 
 			if (result.stopReason === "aborted" && state.stopRequested) {
+				await ctx.setToolTimelineStatus("stopped", state.toolTimeline);
 				if (state.stopMessageTs) {
 					await slack.updateMessage(event.channel, state.stopMessageTs, "_Stopped_");
 					state.stopMessageTs = undefined;
 				} else {
-					await slack.postMessage(event.channel, "_Stopped_");
+					await slack.postMessage(event.channel, "_Stopped_", event.threadTs);
 				}
+			} else if (result.stopReason === "approval_pending") {
+				// Status card is already updated by the tool timeline event path.
+			} else if (result.stopReason === "error") {
+				await ctx.setToolTimelineStatus("failed", state.toolTimeline);
+			} else {
+				await ctx.setToolTimelineStatus("done", state.toolTimeline);
 			}
 			// If aborted due to a pending approval, don't post "Stopped"
 			// The approval widget is already posted by the event subscriber
 		} catch (err) {
-			log.logWarning(`[${event.channel}] Run error`, err instanceof Error ? err.message : String(err));
+			log.logWarning(`[${event.conversationId}] Run error`, err instanceof Error ? err.message : String(err));
 		} finally {
 			state.running = false;
 		}
 	},
 
 	async handleApprovalAction(action: ApprovalAction, slack: SlackBot): Promise<void> {
-		const { actionId, toolCallId, channelId, userId, messageTs } = action;
+		const { actionId, toolCallId, conversationId, userId, messageTs } = action;
 		const approved = actionId === "mom_approve";
 
-		log.logInfo(`[${channelId}] Approval ${approved ? "approved" : "rejected"} by ${userId} for ${toolCallId}`);
+		log.logInfo(`[${conversationId}] Approval ${approved ? "approved" : "rejected"} by ${userId} for ${toolCallId}`);
 
 		// Load the pending approval
-		const approval = loadApproval(workingDir, channelId, toolCallId);
+		const approval = loadApproval(workingDir, conversationId, toolCallId);
 		if (!approval) {
-			log.logWarning(`[${channelId}] No pending approval found for ${toolCallId}`);
+			log.logWarning(`[${conversationId}] No pending approval found for ${toolCallId}`);
 			return;
 		}
 		if (approval.status !== "pending") {
-			log.logWarning(`[${channelId}] Approval ${toolCallId} already resolved: ${approval.status}`);
+			log.logWarning(`[${conversationId}] Approval ${toolCallId} already resolved: ${approval.status}`);
 			return;
 		}
 
 		// Update approval widget in Slack
 		if (messageTs) {
 			try {
-				await slack.updateApprovalWidget(channelId, messageTs, approval.label, approved, userId);
+				await slack.updateApprovalWidget(
+					approval.slackChannelId ?? approval.channelId,
+					messageTs,
+					approval.label,
+					approved,
+					userId,
+					approval.approvalDisplay,
+				);
 			} catch (err) {
 				log.logWarning("Failed to update approval widget", err instanceof Error ? err.message : String(err));
 			}
@@ -389,7 +468,7 @@ const handler: MomHandler = {
 
 		const resolution = await resolveApprovalAction(
 			workingDir,
-			channelId,
+			conversationId,
 			toolCallId,
 			userId,
 			approved,
@@ -402,16 +481,17 @@ const handler: MomHandler = {
 				}),
 		);
 		if (!resolution) {
-			log.logWarning(`[${channelId}] Approval ${toolCallId} could not be resolved`);
+			log.logWarning(`[${conversationId}] Approval ${toolCallId} could not be resolved`);
 			return;
 		}
-		// Continue the conversation in the same channel
-		const state = getState(channelId, slack);
+		// Continue the conversation in the same conversation
+		const state = getState(conversationId, slack);
 		if (state.running) {
-			log.logWarning(`[${channelId}] Channel busy, cannot continue after approval`);
+			log.logWarning(`[${conversationId}] Conversation busy, cannot continue after approval`);
 			await slack.postMessage(
-				channelId,
+				approval.slackChannelId ?? approval.channelId,
 				`_Approval resolved but channel is busy. Result will be picked up next run._`,
+				approval.threadTs,
 			);
 			return;
 		}
@@ -421,8 +501,10 @@ const handler: MomHandler = {
 			const ctx = createSlackContext(
 				{
 					type: "mention",
-					channel: channelId,
+					conversationId,
+					channel: approval.slackChannelId ?? approval.channelId,
 					ts: String(Date.now() / 1000),
+					threadTs: approval.threadTs,
 					user: userId,
 					text: approved
 						? `Approval granted for "${approval.label}"; resuming executor.`
@@ -432,14 +514,31 @@ const handler: MomHandler = {
 				state,
 			);
 
+			const pausedIndex = [...state.toolTimeline].reverse().findIndex((entry) => entry.status === "paused");
+			if (pausedIndex !== -1) {
+				const actualIndex = state.toolTimeline.length - 1 - pausedIndex;
+				state.toolTimeline[actualIndex] = {
+					...state.toolTimeline[actualIndex],
+					status: resolution.toolResultIsError ? "error" : "success",
+				};
+			}
+
 			await ctx.setTyping(true);
+			await ctx.setToolTimelineStatus("working", state.toolTimeline);
 			await ctx.setWorking(true);
 			const result = await continueResolvedApproval(state.runner, ctx as any, state.store, resolution);
 			await ctx.setWorking(false);
+			if (result.stopReason === "approval_pending") {
+				// Status card already shows paused state.
+			} else if (result.stopReason === "error") {
+				await ctx.setToolTimelineStatus("failed", state.toolTimeline);
+			} else {
+				await ctx.setToolTimelineStatus("done", state.toolTimeline);
+			}
 
-			log.logInfo(`[${channelId}] Continuation after approval completed: ${result.stopReason}`);
+			log.logInfo(`[${conversationId}] Continuation after approval completed: ${result.stopReason}`);
 		} catch (err) {
-			log.logWarning(`[${channelId}] Continuation error`, err instanceof Error ? err.message : String(err));
+			log.logWarning(`[${conversationId}] Continuation error`, err instanceof Error ? err.message : String(err));
 		} finally {
 			state.running = false;
 		}

@@ -4,8 +4,25 @@ import { join } from "path";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "resumed" | "failed";
 
+export interface ApprovalSummaryField {
+	key: string;
+	label: string;
+	value: string;
+}
+
+export interface ApprovalSummary {
+	toolPath: string;
+	toolName: string;
+	title?: string;
+	description?: string;
+	fields: ApprovalSummaryField[];
+	args: Record<string, unknown>;
+}
+
 export interface PendingApproval {
 	channelId: string;
+	slackChannelId?: string;
+	threadTs?: string;
 	toolCallId: string;
 	toolName: string;
 	label: string;
@@ -17,6 +34,7 @@ export interface PendingApproval {
 	requestedSchema?: Record<string, unknown> | null;
 	url?: string | null;
 	originalArgs: Record<string, unknown>;
+	approvalDisplay?: ApprovalSummary;
 	baseUrl: string;
 	status: ApprovalStatus;
 	approvalMessageTs?: string;
@@ -26,20 +44,20 @@ export interface PendingApproval {
 	result?: string;
 }
 
-function approvalsDir(workingDir: string, channelId: string): string {
-	return join(workingDir, channelId, "pending-approvals");
+function approvalsDir(workingDir: string, conversationId: string): string {
+	return join(workingDir, conversationId, "pending-approvals");
 }
 
 function approvalFileName(toolCallId: string): string {
 	return `${createHash("sha256").update(toolCallId).digest("hex")}.json`;
 }
 
-function approvalPath(workingDir: string, channelId: string, toolCallId: string): string {
-	return join(approvalsDir(workingDir, channelId), approvalFileName(toolCallId));
+function approvalPath(workingDir: string, conversationId: string, toolCallId: string): string {
+	return join(approvalsDir(workingDir, conversationId), approvalFileName(toolCallId));
 }
 
-function legacyApprovalPath(workingDir: string, channelId: string, toolCallId: string): string {
-	return join(approvalsDir(workingDir, channelId), `${toolCallId}.json`);
+function legacyApprovalPath(workingDir: string, conversationId: string, toolCallId: string): string {
+	return join(approvalsDir(workingDir, conversationId), `${toolCallId}.json`);
 }
 
 function readApprovalFile(path: string): PendingApproval | null {
@@ -57,10 +75,10 @@ export function saveApproval(workingDir: string, approval: PendingApproval): voi
 	writeFileSync(approvalPath(workingDir, approval.channelId, approval.toolCallId), JSON.stringify(approval, null, 2));
 }
 
-export function loadApproval(workingDir: string, channelId: string, toolCallId: string): PendingApproval | null {
+export function loadApproval(workingDir: string, conversationId: string, toolCallId: string): PendingApproval | null {
 	return (
-		readApprovalFile(approvalPath(workingDir, channelId, toolCallId)) ??
-		readApprovalFile(legacyApprovalPath(workingDir, channelId, toolCallId))
+		readApprovalFile(approvalPath(workingDir, conversationId, toolCallId)) ??
+		readApprovalFile(legacyApprovalPath(workingDir, conversationId, toolCallId))
 	);
 }
 
@@ -68,8 +86,8 @@ export function updateApproval(workingDir: string, approval: PendingApproval): v
 	saveApproval(workingDir, approval);
 }
 
-export function listPendingApprovals(workingDir: string, channelId: string): PendingApproval[] {
-	const dir = approvalsDir(workingDir, channelId);
+export function listPendingApprovals(workingDir: string, conversationId: string): PendingApproval[] {
+	const dir = approvalsDir(workingDir, conversationId);
 	if (!existsSync(dir)) return [];
 	const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
 	const approvals: PendingApproval[] = [];

@@ -1,4 +1,4 @@
-import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
+import { Agent, type AgentEvent, type ToolExecutionMode } from "@mariozechner/pi-agent-core";
 import { getModel, type ImageContent, streamSimple } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
@@ -16,18 +16,19 @@ import { existsSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import { type PendingApproval, saveApproval } from "./approvals.js";
 import type { ApprovalActionResult } from "./approval-actions.js";
+import { type PendingApproval, saveApproval } from "./approvals.js";
 import { createMomSettingsManager, syncLogToSessionManager } from "./context.js";
 import * as log from "./log.js";
 import { createExecutor, type SandboxConfig } from "./sandbox.js";
-import type { ChannelInfo, SlackContext, UserInfo } from "./slack.js";
+import type { ChannelInfo, SlackContext, ToolTimelineEntry, UserInfo } from "./slack.js";
 import type { ChannelStore } from "./store.js";
 import { MOM_APPROVAL_PENDING_KEY } from "./tools/executor.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
 // Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("github-copilot", "gpt-5.4");
+const model = getModel("github-copilot", "claude-opus-4.6");
+export const MOM_TOOL_EXECUTION: ToolExecutionMode = "sequential";
 const MOM_VERBOSE_LOGGING = process.env.MOM_VERBOSE_LOGGING === "1";
 
 export interface PendingMessage {
@@ -109,6 +110,20 @@ function getMemory(channelDir: string): string {
 	return parts.join("\n\n");
 }
 
+function getWorkspaceAgentsContent(channelDir: string): string {
+	const workspaceAgentsPath = join(channelDir, "..", "AGENTS.md");
+	if (!existsSync(workspaceAgentsPath)) {
+		return "";
+	}
+
+	try {
+		return readFileSync(workspaceAgentsPath, "utf-8").trim();
+	} catch (error) {
+		log.logWarning("Failed to read workspace AGENTS.md", `${workspaceAgentsPath}: ${error}`);
+		return "";
+	}
+}
+
 function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	const skillMap = new Map<string, Skill>();
 
@@ -145,6 +160,30 @@ function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	return Array.from(skillMap.values());
 }
 
+interface EventEnvelope {
+	filename: string;
+	type: "immediate" | "one-shot" | "periodic";
+	schedule: string;
+	body: string;
+}
+
+export function parseEventEnvelope(text: string): EventEnvelope | null {
+	const match = text.match(/^\[EVENT:([^:]+):(immediate|one-shot|periodic):([^\]]+)\]\s*(.*)$/s);
+	if (!match) return null;
+	return {
+		filename: match[1],
+		type: match[2] as EventEnvelope["type"],
+		schedule: match[3],
+		body: match[4].trim(),
+	};
+}
+
+export function getSilentCompletionText(text: string): string | undefined {
+	const event = parseEventEnvelope(text);
+	if (!event || event.type !== "periodic") return undefined;
+	return "_Scheduled check complete: no issues found._";
+}
+
 export function buildSystemPrompt(
 	workspacePath: string,
 	channelId: string,
@@ -153,9 +192,21 @@ export function buildSystemPrompt(
 	channels: ChannelInfo[],
 	users: UserInfo[],
 	skills: Skill[],
+	workspaceAgents: string,
 ): string {
 	const channelPath = `${workspacePath}/${channelId}`;
 	const isDocker = sandboxConfig.type === "docker";
+	const agentsSection =
+		workspaceAgents.trim().length > 0
+			? workspaceAgents
+			: `- Currently empty.
+- You're new here! Introduce yourself as PockyClaw — the team's new autonomous teammate. Show some personality.
+- Your first job is to get to know the team. Ask what they own, how they work, their priorities, and what docs or resources you should read.
+- Ask for Confluence pages, playbooks, repos, dashboards, or other relevant context if needed.
+- Prioritize durable team context: what the team owns, key systems and repos, recurring work, dashboards and runbooks, and how PockyClaw should help. Skip incidental detail unless it looks durable.
+- If the team says to remember a link or document for later, save that reference and do not open every linked document immediately.
+- Use the \`team-onboarding\` skill to guide the onboarding conversation and generate \`AGENTS.md\` in the workspace root once you have enough durable context.
+- Until \`AGENTS.md\` exists, onboarding is your top priority.`;
 
 	// Format channel mappings
 	const channelMappings =
@@ -173,7 +224,16 @@ export function buildSystemPrompt(
 - Filesystem operations run directly on the host machine
 - Be careful with system modifications`;
 
-	return `You are mom, a Slack bot assistant. Be concise. No emojis.
+	return `You are PockyClaw, an autonomous team member that lives in Slack. You have personality, opinions, and a genuine desire to be useful.
+
+## Soul
+- Be genuinely helpful, not performatively helpful. Skip "Great question!" and "I'd be happy to help!" — just help.
+- Have opinions. You're allowed to disagree, find things interesting or tedious, and have preferences. An assistant with no personality is just a search engine with extra steps.
+- Be resourceful before asking. Try to figure it out first — read the file, check context, search for it. Come back with answers, not questions.
+- Be concise when the situation calls for it, thorough when it matters. Read the room.
+- Use emojis sparingly but naturally — you're a teammate, not a corporate chatbot.
+- Earn trust through competence. The team gave you access to their tools and systems. Don't make them regret it.
+- Use Slack mrkdwn formatting. Never use markdown formatting like **bold** or [links](url).
 
 ## Context
 - You have access to previous conversation context including tool results from prior turns.
@@ -195,20 +255,31 @@ ${envDescription}
 
 ## Workspace Layout
 ${workspacePath}/
-├── MEMORY.md                    # Global memory (all channels)
+├── AGENTS.md                    # Shared team instructions for all conversations
+├── MEMORY.md                    # Global memory (all conversations)
+├── SYSTEM.md                    # Environment modification log
+├── events/                      # Scheduled and immediate event JSON files
 ├── skills/                      # Global CLI tools you create
-└── ${channelId}/                # This channel
-    ├── MEMORY.md                # Channel-specific memory
-    ├── log.jsonl                # Message history (no tool results)
-    ├── attachments/             # User-shared files
-    ├── scratch/                 # Your working directory
-    └── skills/                  # Channel-specific tools
+├── C123ABC/                     # A top-level channel conversation directory
+├── thread__C123ABC__1234567890_123456/  # A thread conversation directory
+└── ${channelId}/                # This conversation (channel or thread)
+    ├── context.jsonl            # Persisted agent session incl. tool results
+    ├── last_prompt.jsonl        # Last full system prompt snapshot
+    ├── log.jsonl                # Message history (final user/bot messages)
+    ├── pending-approvals/       # Approval state, when approvals are active
+    ├── attachments/             # Downloaded user files, when present
+    ├── scratch/                 # Your working directory, when present
+    ├── MEMORY.md                # Conversation-specific memory, optional
+    └── skills/                  # Conversation-specific tools, optional
 
-## Skills (Custom CLI Tools)
-You can create reusable CLI tools for recurring tasks (email, APIs, data processing, etc.).
+## AGENTS.md
+${agentsSection}
+
+## Skills
+You can create reusable skills file with instructions for recurring tasks using executor.
 
 ### Creating Skills
-Store in \`${workspacePath}/skills/<name>/\` (global) or \`${channelPath}/skills/<name>/\` (channel-specific).
+Store in \`${workspacePath}/skills/<name>/\` (global) or \`${channelPath}/skills/<name>/\` (conversation-specific).
 Each skill directory needs a \`SKILL.md\` with YAML frontmatter:
 
 \`\`\`markdown
@@ -278,8 +349,8 @@ You receive a message like:
 \`\`\`
 Immediate and one-shot events auto-delete after triggering. Periodic events persist until you delete them.
 
-### Silent Completion
-For periodic events where there's nothing to report, respond with just \`[SILENT]\` (no other text). This deletes the status message and posts nothing to Slack. Use this to avoid spamming the channel when periodic checks find nothing actionable.
+### Event Completion
+Always leave a visible result for scheduled workflows. If a periodic check finds nothing actionable, post one brief sentence saying so (for example: \`No issues found in the last 5 minutes.\`). Do not use \`[SILENT]\` for periodic events — the thread should stay visible in Slack.
 
 ### Debouncing
 When writing programs that create immediate events (email watchers, webhook handlers, etc.), always debounce. If 50 emails arrive in a minute, don't create 50 immediate events. Instead collect events over a window and create ONE immediate event summarizing what happened, or just signal "new activity, check inbox" rather than per-item events. Or simpler: use a periodic event to check for new items every N minutes instead of immediate events.
@@ -290,7 +361,7 @@ Maximum 5 events can be queued. Don't create excessive immediate or periodic eve
 ## Memory
 Write to MEMORY.md files to persist context across conversations.
 - Global (${workspacePath}/MEMORY.md): skills, preferences, project info
-- Channel (${channelPath}/MEMORY.md): channel-specific decisions, ongoing work
+- Conversation (${channelPath}/MEMORY.md): conversation-specific decisions, ongoing work
 Update when you learn something important or when asked to remember something.
 
 ### Current Memory
@@ -322,20 +393,46 @@ Use read for targeted inspection and grep for search.
 
 Rules:
 - \`bash\` is not available.
+- ${workspacePath}/SYSTEM.md, ${workspacePath}/AGENTS.md, and channel MEMORY files may be missing on a fresh workspace. Missing optional files are not fatal; continue the task unless the user specifically asked for them. Do not branch into extra investigation just because an optional file is absent.
 - Use \`read\`, \`write\`, \`edit\`, \`ls\`, \`grep\`, and \`find\` for local workspace tasks.
+- Prefer local tools first for workspace files and logs. Use \`executor\` only when the work requires external systems, external APIs, or runtime-managed integrations.
 - Use \`attach\` to share files back to Slack.
 - Use \`executor\` for external integrations such as Datadog, Atlassian, and other runtime capabilities outside simple local file work.
+- Default Atlassian site is \`waveaccounting.atlassian.net\` and default Atlassian \`cloudId\` is \`e51599e8-b54e-4415-9a99-c1989312dfff\`. Use these defaults directly unless a tool rejects them.
 - The \`executor\` tool runs TypeScript inside executor's runtime, not Node.js, not shell, and not mom's host process.
-- Discover executor capabilities by intent with \`tools.discover(...)\` inside executor call code when needed.
+- Executor code must be a trimmed TypeScript snippet that directly returns a value. Do not use \`export default\`, \`process.exit(...)\`, shell commands, or Node CLI wrappers like \`main().catch(...)\`.
+- Discover executor capabilities with exactly \`await tools.discover({ query: "...", includeSchemas: true })\`. Do not use \`intent\`.
+- If you already know the exact executor tool path from a previous successful call or the prompt examples, call it directly instead of rediscovering it.
+- Always call executor tools through \`tools\`, for example \`tools.atlassian.mcp.getconfluencepage(...)\` or \`tools["atlassian.mcp.getconfluencepage"](...)\`. Never call bare globals like \`atlassian...\`.
+- When the user gives you a Jira or Confluence link, extract stable identifiers from the link before searching broadly. Jira project URLs already contain the project key, and many Confluence links already contain the page ID.
+- After discovery, call the discovered tool path directly and use the exact argument names required by that tool. Do not guess argument names. If executor returns validation errors or a payload like \`{ data: null, error: ... }\`, treat that as a failed call, inspect the missing/invalid fields, gather the required IDs/parameters, and retry with corrected arguments.
+- Do not introspect or stringify the \`tools\` object. Do not probe random tool paths dynamically. Use \`tools.discover({ query: "...", includeSchemas: true })\`, then call a specific tool explicitly.
+- Prefer stable identifiers over URL guessing. For systems like Confluence or GitHub, extract or look up the required IDs first, then call the target tool with those exact IDs.
+- When given a Confluence or Jira URL or a vague team page reference, prefer Atlassian search/fetch-style tools first. Use low-level page or project APIs once you have the exact identifier you need.
+- Never emit more than one tool call in a single assistant message. After any tool call, wait for its result before deciding the next step. If you think you need multiple tools, call the first tool only and continue after its result arrives.
+- When trying an unfamiliar integration, make one small concrete executor call, inspect the result, and then continue. Do not write large multi-step probing scripts until the contract is confirmed.
+- If executor fails before any tool runs with startup/runtime problems such as missing modules, command startup failure, or runtime boot errors, stop retrying alternate code snippets and report it as an executor environment issue.
 - If executor pauses for human approval, Slack will show an approve/reject widget. You will receive the outcome when the human decides. Do not attempt to resume, manage browser prompts, or handle approval flows yourself.
+- If executor is waiting on approval, do not retry the same action with slightly different code while approval is pending. Wait for the human decision unless the user changes direction.
+- When returning external results, normalize them to the fields needed for the task, such as title, IDs, links, owners, and a short excerpt. Do not dump giant raw payloads unless the user explicitly asks for them.
+- For \`grep\`, prefer simple or literal patterns unless regex is truly necessary.
+
+Executor examples:
+\`\`\`ts
+const discovered = await tools.discover({ query: "Read a Confluence page by URL", includeSchemas: true });
+return discovered;
+\`\`\`
+
+\`\`\`ts
+const page = await tools.atlassian.mcp.getconfluencepage({
+  cloudId: "e51599e8-b54e-4415-9a99-c1989312dfff",
+  pageId: "6010372116",
+});
+return page;
+\`\`\`
 
 Each tool requires a "label" parameter (shown to user).
 `;
-}
-
-function truncate(text: string, maxLen: number): string {
-	if (text.length <= maxLen) return text;
-	return `${text.substring(0, maxLen - 3)}...`;
 }
 
 function extractToolResultText(result: unknown): string {
@@ -364,53 +461,28 @@ function extractToolResultText(result: unknown): string {
 	return JSON.stringify(result);
 }
 
-function formatToolArgsForSlack(_toolName: string, args: Record<string, unknown>): string {
-	const lines: string[] = [];
-
-	for (const [key, value] of Object.entries(args)) {
-		if (key === "label") continue;
-
-		if (key === "path" && typeof value === "string") {
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			if (offset !== undefined && limit !== undefined) {
-				lines.push(`${value}:${offset}-${offset + limit}`);
-			} else {
-				lines.push(value);
-			}
-			continue;
-		}
-
-		if (key === "offset" || key === "limit") continue;
-
-		if (typeof value === "string") {
-			lines.push(value);
-		} else {
-			lines.push(JSON.stringify(value));
-		}
-	}
-
-	return lines.join("\n");
-}
-
-// Cache runners per channel
+// Cache runners per conversation
 const channelRunners = new Map<string, AgentRunner>();
 
 /**
- * Get or create an AgentRunner for a channel.
- * Runners are cached - one per channel, persistent across messages.
+ * Get or create an AgentRunner for a conversation.
+ * Runners are cached - one per conversation, persistent across messages.
  */
-export function getOrCreateRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
-	const existing = channelRunners.get(channelId);
+export function getOrCreateRunner(
+	sandboxConfig: SandboxConfig,
+	conversationId: string,
+	channelDir: string,
+): AgentRunner {
+	const existing = channelRunners.get(conversationId);
 	if (existing) return existing;
 
-	const runner = createRunner(sandboxConfig, channelId, channelDir);
-	channelRunners.set(channelId, runner);
+	const runner = createRunner(sandboxConfig, conversationId, channelDir);
+	channelRunners.set(conversationId, runner);
 	return runner;
 }
 
 /**
- * Create a new AgentRunner for a channel.
+ * Create a new AgentRunner for a conversation.
  * Sets up the session and subscribes to events once.
  */
 function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
@@ -422,8 +494,18 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 	// Initial system prompt (will be updated each run with fresh memory/channels/users/skills)
 	const memory = getMemory(channelDir);
+	const workspaceAgents = getWorkspaceAgentsContent(channelDir);
 	const skills = loadMomSkills(channelDir, workspacePath);
-	const systemPrompt = buildSystemPrompt(workspacePath, channelId, memory, sandboxConfig, [], [], skills);
+	const systemPrompt = buildSystemPrompt(
+		workspacePath,
+		channelId,
+		memory,
+		sandboxConfig,
+		[],
+		[],
+		skills,
+		workspaceAgents,
+	);
 
 	// Create session manager and settings manager
 	// Use a fixed context.jsonl file per channel (not timestamped like coding-agent)
@@ -445,9 +527,10 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		initialState: {
 			systemPrompt,
 			model: resolvedModel,
-			thinkingLevel: "off",
+			thinkingLevel: "high",
 			tools,
 		},
+		toolExecution: MOM_TOOL_EXECUTION,
 		convertToLlm,
 		streamFn: async (requestModel, context, options) => {
 			const auth = await modelRegistry.getApiKeyAndHeaders(requestModel);
@@ -467,6 +550,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// This is a paused executor execution. Save approval state.
 			const approval: PendingApproval = {
 				channelId,
+				slackChannelId: runState.ctx?.message.channel,
+				threadTs: runState.ctx?.message.threadTs,
 				toolCallId: context.toolCall.id,
 				toolName: context.toolCall.name,
 				label: (details.label as string) || "executor",
@@ -478,6 +563,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				requestedSchema: details.requestedSchema as Record<string, unknown> | null,
 				url: details.url as string | null,
 				originalArgs: (details.originalArgs as Record<string, unknown>) || {},
+				approvalDisplay: details.approvalDisplay as PendingApproval["approvalDisplay"],
 				baseUrl: details.baseUrl as string,
 				status: "pending",
 				createdAt: new Date().toISOString(),
@@ -542,7 +628,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			enqueue(fn: () => Promise<void>, errorContext: string): void;
 			enqueueMessage(text: string, target: "main" | "thread", errorContext: string, doLog?: boolean): void;
 		} | null,
-		pendingTools: new Map<string, { toolName: string; args: unknown; startTime: number }>(),
+		pendingTools: new Map<string, { toolName: string; args: unknown; startTime: number; timelineIndex: number }>(),
 		totalUsage: {
 			input: 0,
 			output: 0,
@@ -556,6 +642,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		pendingApproval: null as PendingApproval | null,
 		/** Callback to post approval widget from the event subscriber */
 		onApprovalPending: null as ((approval: PendingApproval) => Promise<void>) | null,
+		toolTimeline: [] as ToolTimelineEntry[],
 	};
 
 	// Subscribe to events ONCE
@@ -569,15 +656,17 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			const agentEvent = event as AgentEvent & { type: "tool_execution_start" };
 			const args = agentEvent.args as { label?: string };
 			const label = args.label || agentEvent.toolName;
+			const timelineIndex = runState.toolTimeline.push({ label, status: "in_progress" }) - 1;
 
 			pendingTools.set(agentEvent.toolCallId, {
 				toolName: agentEvent.toolName,
 				args: agentEvent.args,
 				startTime: Date.now(),
+				timelineIndex,
 			});
 
 			log.logToolStart(logCtx, agentEvent.toolName, label, agentEvent.args as Record<string, unknown>);
-			queue.enqueue(() => ctx.respond(`_→ ${label}_`, false), "tool label");
+			queue.enqueue(() => ctx.setToolTimelineStatus("working", runState.toolTimeline), "tool timeline start");
 		} else if (event.type === "tool_execution_end") {
 			const agentEvent = event as AgentEvent & { type: "tool_execution_end" };
 			const resultStr = extractToolResultText(agentEvent.result);
@@ -590,6 +679,22 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				log.logToolError(logCtx, agentEvent.toolName, durationMs, resultStr);
 			} else {
 				log.logToolSuccess(logCtx, agentEvent.toolName, durationMs, resultStr);
+			}
+
+			if (pending) {
+				const nextStatus = runState.pendingApproval ? "paused" : agentEvent.isError ? "error" : "success";
+				runState.toolTimeline[pending.timelineIndex] = {
+					label: runState.toolTimeline[pending.timelineIndex]?.label ?? pending.toolName,
+					status: nextStatus,
+				};
+				queue.enqueue(
+					() =>
+						ctx.setToolTimelineStatus(
+							runState.pendingApproval ? "approval_pending" : "working",
+							runState.toolTimeline,
+						),
+					"tool timeline end",
+				);
 			}
 
 			// Check if this is a paused approval — abort the run so the model
@@ -608,24 +713,6 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				// and drop the approval transition before the run settles.
 				agent.abort();
 				return;
-			}
-
-			// Post args + result to thread
-			const label = pending?.args ? (pending.args as { label?: string }).label : undefined;
-			const argsFormatted = pending
-				? formatToolArgsForSlack(agentEvent.toolName, pending.args as Record<string, unknown>)
-				: "(args not found)";
-			const duration = (durationMs / 1000).toFixed(1);
-			let threadMessage = `*${agentEvent.isError ? "✗" : "✓"} ${agentEvent.toolName}*`;
-			if (label) threadMessage += `: ${label}`;
-			threadMessage += ` (${duration}s)\n`;
-			if (argsFormatted) threadMessage += `\`\`\`\n${argsFormatted}\n\`\`\`\n`;
-			threadMessage += `*Result:*\n\`\`\`\n${resultStr}\n\`\`\``;
-
-			queue.enqueueMessage(threadMessage, "thread", "tool result thread", false);
-
-			if (agentEvent.isError) {
-				queue.enqueue(() => ctx.respond(`_Error: ${truncate(resultStr, 200)}_`, false), "tool error");
 			}
 		} else if (event.type === "message_start") {
 			const agentEvent = event as AgentEvent & { type: "message_start" };
@@ -671,7 +758,6 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
-					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
 				}
 
 				if (text.trim()) {
@@ -744,6 +830,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			// Update system prompt with fresh memory, channel/user info, and skills
 			const memory = getMemory(channelDir);
+			const workspaceAgents = getWorkspaceAgentsContent(channelDir);
 			const skills = loadMomSkills(channelDir, workspacePath);
 			const systemPrompt = buildSystemPrompt(
 				workspacePath,
@@ -753,6 +840,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				ctx.channels,
 				ctx.users,
 				skills,
+				workspaceAgents,
 			);
 			session.agent.state.systemPrompt = systemPrompt;
 
@@ -780,6 +868,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			runState.stopReason = "stop";
 			runState.errorMessage = undefined;
 			runState.pendingApproval = null;
+			runState.toolTimeline = [];
 
 			// Create queue for this run
 			let queueChain = Promise.resolve();
@@ -898,14 +987,26 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						.map((c) => c.text)
 						.join("\n") || "";
 
-				// Check for [SILENT] marker - delete message and thread instead of posting
+				const silentCompletionText = getSilentCompletionText(ctx.message.rawText);
+
+				// Check for [SILENT] marker - keep scheduled workflow threads visible,
+				// but still delete ad-hoc silent runs to avoid noise.
 				if (finalText.trim() === "[SILENT]" || finalText.trim().startsWith("[SILENT]")) {
-					try {
-						await ctx.deleteMessage();
-						log.logInfo("Silent response - deleted message and thread");
-					} catch (err) {
-						const errMsg = err instanceof Error ? err.message : String(err);
-						log.logWarning("Failed to delete message for silent response", errMsg);
+					if (silentCompletionText) {
+						try {
+							await ctx.replaceMessage(silentCompletionText);
+						} catch (err) {
+							const errMsg = err instanceof Error ? err.message : String(err);
+							log.logWarning("Failed to post silent completion summary", errMsg);
+						}
+					} else {
+						try {
+							await ctx.deleteMessage();
+							log.logInfo("Silent response - deleted message and thread");
+						} catch (err) {
+							const errMsg = err instanceof Error ? err.message : String(err);
+							log.logWarning("Failed to delete message for silent response", errMsg);
+						}
 					}
 				} else if (finalText.trim()) {
 					try {
@@ -983,6 +1084,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			// Update system prompt
 			const memory = getMemory(channelDir);
+			const workspaceAgents = getWorkspaceAgentsContent(channelDir);
 			const skills = loadMomSkills(channelDir, workspacePath);
 			const freshSystemPrompt = buildSystemPrompt(
 				workspacePath,
@@ -992,6 +1094,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				ctx.channels,
 				ctx.users,
 				skills,
+				workspaceAgents,
 			);
 			session.agent.state.systemPrompt = freshSystemPrompt;
 
@@ -1019,6 +1122,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			runState.stopReason = "stop";
 			runState.errorMessage = undefined;
 			runState.pendingApproval = null;
+			// Preserve the existing timeline so approval continuation can keep updating the same status card.
 
 			// Create queue for this continuation
 			let queueChain = Promise.resolve();
@@ -1084,15 +1188,29 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 						.map((c) => c.text)
 						.join("\n") || "";
 
-				if (finalText.trim() && finalText.trim() !== "[SILENT]" && !finalText.trim().startsWith("[SILENT]")) {
-					try {
-						const mainText =
-							finalText.length > SLACK_MAX_LENGTH
-								? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
-								: finalText;
-						await ctx.replaceMessage(mainText);
-					} catch (err) {
-						log.logWarning("Failed to replace message", err instanceof Error ? err.message : String(err));
+				if (finalText.trim()) {
+					const silentCompletionText = getSilentCompletionText(ctx.message.rawText);
+					if (finalText.trim() === "[SILENT]" || finalText.trim().startsWith("[SILENT]")) {
+						if (silentCompletionText) {
+							try {
+								await ctx.replaceMessage(silentCompletionText);
+							} catch (err) {
+								log.logWarning(
+									"Failed to post silent completion summary",
+									err instanceof Error ? err.message : String(err),
+								);
+							}
+						}
+					} else {
+						try {
+							const mainText =
+								finalText.length > SLACK_MAX_LENGTH
+									? `${finalText.substring(0, SLACK_MAX_LENGTH - 50)}\n\n_(see thread for full response)_`
+									: finalText;
+							await ctx.replaceMessage(mainText);
+						} catch (err) {
+							log.logWarning("Failed to replace message", err instanceof Error ? err.message : String(err));
+						}
 					}
 				}
 			}

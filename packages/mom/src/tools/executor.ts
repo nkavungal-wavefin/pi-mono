@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
+import type { ApprovalSummary } from "../approvals.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateTail } from "./truncate.js";
 
 const FALLBACK_EXECUTOR_ROOT = "/Users/nkavungal/Workspace/pockyclaw/executor";
@@ -40,6 +41,7 @@ type ParsedExecutorOutput =
 				message?: string;
 				resumeCommand?: string;
 				instruction?: string;
+				approvalDisplay?: ApprovalSummary;
 				interaction?: {
 					mode?: "form" | "url";
 					message?: string;
@@ -62,6 +64,7 @@ interface ExecutorToolDetails {
 	instruction?: string;
 	requestedSchema?: Record<string, unknown> | null;
 	url?: string | null;
+	approvalDisplay?: ApprovalSummary;
 }
 
 /**
@@ -151,6 +154,7 @@ export function createExecutorTool(): AgentTool<typeof executorSchema> {
 						instruction: parsed.paused.instruction,
 						requestedSchema: parsed.paused.interaction?.requestedSchema ?? null,
 						url: parsed.paused.interaction?.url ?? null,
+						approvalDisplay: formatted.details.approvalDisplay,
 						originalArgs: { ...params },
 					} satisfies ExecutorToolDetails & {
 						[MOM_APPROVAL_PENDING_KEY]: true;
@@ -359,6 +363,33 @@ function tryParseJson(text: string): { parsedJson?: unknown; parsedText?: string
 	}
 }
 
+function parseApprovalSummary(value: unknown): ApprovalSummary | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const candidate = value as Record<string, unknown>;
+	if (typeof candidate.toolPath !== "string") return undefined;
+	if (typeof candidate.toolName !== "string") return undefined;
+	if (!Array.isArray(candidate.fields)) return undefined;
+	if (!candidate.args || typeof candidate.args !== "object" || Array.isArray(candidate.args)) return undefined;
+
+	const fields = candidate.fields.flatMap((field) => {
+		if (!field || typeof field !== "object") return [];
+		const entry = field as Record<string, unknown>;
+		if (typeof entry.key !== "string") return [];
+		if (typeof entry.label !== "string") return [];
+		if (typeof entry.value !== "string") return [];
+		return [{ key: entry.key, label: entry.label, value: entry.value }];
+	});
+
+	return {
+		toolPath: candidate.toolPath,
+		toolName: candidate.toolName,
+		title: typeof candidate.title === "string" ? candidate.title : undefined,
+		description: typeof candidate.description === "string" ? candidate.description : undefined,
+		fields,
+		args: candidate.args as Record<string, unknown>,
+	};
+}
+
 function parseExecutorOutput(stdout: string, exitCode: number | null): ParsedExecutorOutput {
 	const trimmed = stdout.trim();
 	const { parsedJson, parsedText } = tryParseJson(trimmed);
@@ -370,12 +401,29 @@ function parseExecutorOutput(stdout: string, exitCode: number | null): ParsedExe
 		parsedJson !== null &&
 		(parsedJson as { status?: string }).status === "waiting_for_interaction"
 	) {
+		const paused = parsedJson as {
+			id: string;
+			status: "waiting_for_interaction";
+			interactionId?: string;
+			message?: string;
+			resumeCommand?: string;
+			instruction?: string;
+			approvalDisplay?: unknown;
+			interaction?: {
+				mode?: "form" | "url";
+				message?: string;
+				url?: string | null;
+				requestedSchema?: Record<string, unknown> | null;
+				approvalDisplay?: unknown;
+			};
+		};
+		const approvalDisplay = parseApprovalSummary(paused.approvalDisplay ?? paused.interaction?.approvalDisplay);
 		return {
 			kind: "waiting_for_interaction",
 			text: trimmed,
-			paused: parsedJson as ParsedExecutorOutput & {
-				id: string;
-				status: "waiting_for_interaction";
+			paused: {
+				...paused,
+				approvalDisplay,
 			},
 		};
 	}
@@ -385,22 +433,6 @@ function parseExecutorOutput(stdout: string, exitCode: number | null): ParsedExe
 		text: parsedText ?? (trimmed.length > 0 ? trimmed : "(no output)"),
 		parsedJson,
 	};
-}
-
-function formatInteractiveResponseInput(input: Record<string, unknown>): string {
-	const lines = Object.values(input).map((value) => {
-		if (typeof value === "boolean") {
-			return value ? "yes" : "no";
-		}
-		if (typeof value === "number" || typeof value === "bigint") {
-			return String(value);
-		}
-		if (typeof value === "string") {
-			return value;
-		}
-		return JSON.stringify(value);
-	});
-	return `${lines.join("\n")}\n`;
 }
 
 function truncateOutput(text: string): { text: string; truncation?: TruncationResult } {
@@ -443,6 +475,7 @@ function formatExecutorResult(
 				instruction: paused.instruction,
 				requestedSchema: paused.interaction?.requestedSchema ?? null,
 				url: paused.interaction?.url ?? null,
+				approvalDisplay: paused.approvalDisplay,
 			},
 		};
 	}
@@ -473,15 +506,18 @@ function formatExecutorEnvelope(
 	if (envelope.execution.status === "waiting_for_interaction" && envelope.pendingInteraction) {
 		let instruction = "Execution paused because executor needs additional input.";
 		let requestedSchema: Record<string, unknown> | null = null;
+		let approvalDisplay: ApprovalSummary | undefined;
 		try {
 			const payload = JSON.parse(envelope.pendingInteraction.payloadJson) as {
 				elicitation?: { message?: string; requestedSchema?: Record<string, unknown> };
+				approvalDisplay?: unknown;
 			};
 			const message = payload.elicitation?.message;
 			if (typeof message === "string" && message.trim().length > 0) {
 				instruction = `Execution paused because executor needs additional input. The interaction prompt is "${message}".`;
 			}
 			requestedSchema = payload.elicitation?.requestedSchema ?? null;
+			approvalDisplay = parseApprovalSummary(payload.approvalDisplay);
 		} catch {
 			// Keep fallback instruction
 		}
@@ -497,6 +533,7 @@ function formatExecutorEnvelope(
 				instruction,
 				requestedSchema,
 				url: null,
+				approvalDisplay,
 			},
 		};
 	}

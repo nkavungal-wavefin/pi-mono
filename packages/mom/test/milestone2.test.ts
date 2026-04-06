@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "vitest";
 import { continueResolvedApproval, resolveApprovalAction } from "../src/approval-actions.js";
-import type { ApprovalStatus } from "../src/approvals.js";
+import type { ApprovalStatus, ApprovalSummary } from "../src/approvals.js";
 import {
 	findApprovalAcrossChannels,
 	listPendingApprovals,
@@ -13,7 +13,7 @@ import {
 	saveApproval,
 	updateApproval,
 } from "../src/approvals.js";
-import { buildApprovalWidgetBlocks, buildResolvedApprovalMessage } from "../src/slack.js";
+import { buildApprovalWidgetBlocks, buildAssistantStatusText, buildResolvedApprovalMessage } from "../src/slack.js";
 import { createExecutorTool, MOM_APPROVAL_PENDING_KEY } from "../src/tools/executor.js";
 
 // ============================================================================
@@ -219,10 +219,34 @@ test("executor tool requires code for call action", async () => {
 // ============================================================================
 
 test("buildApprovalWidgetBlocks encodes approve/reject actions", () => {
-	const blocks = buildApprovalWidgetBlocks("C123", "tc-123", "Create Jira issue", "Needs approval");
-	assert.strictEqual(blocks.length, 3);
+	const approvalDisplay: ApprovalSummary = {
+		toolPath: "atlassian.mcp.createjiraissue",
+		toolName: "createJiraIssue",
+		title: "Create Jira issue",
+		description: "Creates a Jira issue in the requested project.",
+		fields: [
+			{ key: "projectKey", label: "Project", value: "INC" },
+			{ key: "summary", label: "Summary", value: "Payments API elevated 5xx in prod" },
+		],
+		args: { projectKey: "INC", summary: "Payments API elevated 5xx in prod" },
+	};
+	const blocks = buildApprovalWidgetBlocks(
+		"thread__C123__1712345678_000100",
+		"tc-123",
+		"Create Jira issue",
+		"Needs approval",
+		approvalDisplay,
+	);
+	assert.strictEqual(blocks.length, 5);
+	assert.strictEqual(blocks[0]?.type, "header");
+	const titleSection = blocks[1] as { text: { text: string } };
+	assert.match(titleSection.text.text, /Create Jira issue/);
+	const descriptionContext = blocks[2] as { elements: Array<{ text: string }> };
+	assert.match(descriptionContext.elements[0]?.text ?? "", /requested project/);
+	const fieldsSection = blocks[3] as { fields: Array<{ text: string }> };
+	assert.match(fieldsSection.fields[0]?.text ?? "", /Project/);
 
-	const actionsBlock = blocks[2] as {
+	const actionsBlock = blocks[4] as {
 		type: string;
 		elements: Array<{ action_id: string; value: string }>;
 	};
@@ -233,21 +257,110 @@ test("buildApprovalWidgetBlocks encodes approve/reject actions", () => {
 	);
 	assert.deepStrictEqual(JSON.parse(actionsBlock.elements[0].value), {
 		toolCallId: "tc-123",
-		channelId: "C123",
+		conversationId: "thread__C123__1712345678_000100",
 	});
 	assert.deepStrictEqual(JSON.parse(actionsBlock.elements[1].value), {
 		toolCallId: "tc-123",
-		channelId: "C123",
+		conversationId: "thread__C123__1712345678_000100",
 	});
 });
 
 test("buildResolvedApprovalMessage formats approved state", () => {
-	const resolved = buildResolvedApprovalMessage("Create Jira issue", true, "U123");
+	const resolved = buildResolvedApprovalMessage("Create Jira issue", true, "U123", {
+		toolPath: "atlassian.mcp.createjiraissue",
+		toolName: "createJiraIssue",
+		title: "Create Jira issue",
+		description: "Creates a Jira issue in the requested project.",
+		fields: [{ key: "projectKey", label: "Project", value: "INC" }],
+		args: { projectKey: "INC" },
+	});
 	assert.match(resolved.text, /Approved/);
 	assert.match(resolved.text, /Create Jira issue/);
 	assert.match(resolved.text, /<@U123>/);
-	const section = resolved.blocks[0] as { text: { text: string } };
+	assert.strictEqual(resolved.blocks[0]?.type, "header");
+	const section = resolved.blocks[1] as { text: { text: string } };
 	assert.match(section.text.text, /Approved/);
+});
+
+test("buildAssistantStatusText formats thinking and latest tool progress", () => {
+	assert.strictEqual(buildAssistantStatusText([]), "💭 Thinking...");
+	assert.strictEqual(buildAssistantStatusText([], "playbook-sync"), "⏳ Handling playbook-sync...");
+	assert.strictEqual(
+		buildAssistantStatusText([{ label: "fetchPlaybook", status: "success" }]),
+		"✅ Completed fetchPlaybook",
+	);
+	assert.strictEqual(
+		buildAssistantStatusText([{ label: "searchConfluence", status: "in_progress" }]),
+		"⏳ Working on searchConfluence",
+	);
+	assert.strictEqual(
+		buildAssistantStatusText([{ label: "createJiraIssue", status: "paused" }]),
+		"⏸ Waiting for approval on createJiraIssue",
+	);
+	assert.strictEqual(
+		buildAssistantStatusText([{ label: "assignCopilot", status: "error" }]),
+		"❌ Failed assignCopilot",
+	);
+
+	const longMessage = buildAssistantStatusText([
+		{ label: "Check environment modification log before external access", status: "success" },
+	]);
+	assert.ok(longMessage.length <= 72);
+	assert.match(longMessage, /^✅ Completed Check environment/);
+});
+
+test("buildApprovalWidgetBlocks suppresses verbose descriptions when fields are present", () => {
+	const blocks = buildApprovalWidgetBlocks(
+		"thread__C123__1712345678_000100",
+		"tc-verbose",
+		"Create an issue",
+		undefined,
+		{
+			toolPath: "github.issues.create",
+			toolName: "createIssue",
+			title: "Create an issue",
+			description:
+				"Any user with pull access to a repository can create an issue.\n\n- application/vnd.github.raw+json\n- application/vnd.github.text+json\n- application/vnd.github.html+json",
+			fields: [
+				{ key: "owner", label: "Owner", value: "nkavungal-wavefin" },
+				{ key: "repo", label: "Repo", value: "pi-mono" },
+				{ key: "title", label: "Title", value: "Test issue for Copilot remote agent assignment" },
+			],
+			args: {
+				owner: "nkavungal-wavefin",
+				repo: "pi-mono",
+				title: "Test issue for Copilot remote agent assignment",
+			},
+		},
+	);
+
+	assert.strictEqual(blocks.length, 4);
+	const fieldsSection = blocks[2] as { fields: Array<{ text: string }> };
+	assert.match(fieldsSection.fields[0]?.text ?? "", /Owner/);
+	assert.match(fieldsSection.fields[1]?.text ?? "", /Repo/);
+	assert.match(fieldsSection.fields[2]?.text ?? "", /Title/);
+});
+
+test("buildApprovalWidgetBlocks truncates oversized field values for Slack", () => {
+	const blocks = buildApprovalWidgetBlocks(
+		"thread__C123__1712345678_000100",
+		"tc-long-field",
+		"Create GitHub issue",
+		undefined,
+		{
+			toolPath: "github.mcp.issue_write",
+			toolName: "issue_write",
+			title: "Create GitHub issue",
+			description: "Creates a GitHub issue in the requested repository.",
+			fields: [{ key: "body", label: "Body", value: "x".repeat(2500) }],
+			args: { body: "x".repeat(2500) },
+		},
+	);
+
+	const fieldsSection = blocks[3] as { fields: Array<{ text: string }> };
+	assert.ok((fieldsSection.fields[0]?.text.length ?? 0) <= 2000);
+	assert.match(fieldsSection.fields[0]?.text ?? "", /^\*Body\*\n/);
+	assert.match(fieldsSection.fields[0]?.text ?? "", /…$/);
 });
 
 // ============================================================================
@@ -276,8 +389,8 @@ test("resolveApprovalAction resumes approved executor call and persists resumed 
 
 		assert.ok(result);
 		assert.strictEqual(result.approved, true);
-		assert.match(result.resultText, /approved/);
-		assert.match(result.resultText, /Issue created: ENG-123/);
+		assert.strictEqual(result.toolResultIsError, false);
+		assert.match(result.toolResultText, /Issue created: ENG-123/);
 
 		const stored = loadApproval(tempDir, "C123", "tc-resume");
 		assert.ok(stored);
@@ -313,7 +426,8 @@ test("resolveApprovalAction persists rejected state without resuming executor", 
 		assert.ok(result);
 		assert.strictEqual(result.approved, false);
 		assert.strictEqual(resumeCalled, false);
-		assert.match(result.resultText, /rejected/);
+		assert.strictEqual(result.toolResultIsError, true);
+		assert.match(result.toolResultText, /rejected/);
 
 		const stored = loadApproval(tempDir, "C123", "tc-reject");
 		assert.ok(stored);
@@ -325,10 +439,14 @@ test("resolveApprovalAction persists rejected state without resuming executor", 
 });
 
 test("continueResolvedApproval forwards both approve and reject results to session continuation", async () => {
-	const calls: string[] = [];
+	const calls: Array<{ approved: boolean; text: string }> = [];
 	const runner = {
-		async continueAfterApproval(_ctx: unknown, _store: unknown, approvalResultText: string) {
-			calls.push(approvalResultText);
+		async continueAfterApproval(
+			_ctx: unknown,
+			_store: unknown,
+			resolution: { approved: boolean; toolResultText: string },
+		) {
+			calls.push({ approved: resolution.approved, text: resolution.toolResultText });
 			return { stopReason: "stop" };
 		},
 	};
@@ -359,8 +477,8 @@ test("continueResolvedApproval forwards both approve and reject results to sessi
 			createdAt: new Date().toISOString(),
 		},
 		approved: true,
-		resultText:
-			'[APPROVAL RESULT] The executor call "Create Jira issue" was *approved* by <@U1>.\n\nResult:\nIssue created',
+		toolResultText: "Issue created",
+		toolResultIsError: false,
 	};
 	const rejected = {
 		approval: {
@@ -375,15 +493,18 @@ test("continueResolvedApproval forwards both approve and reject results to sessi
 			createdAt: new Date().toISOString(),
 		},
 		approved: false,
-		resultText: '[APPROVAL RESULT] The executor call "Create Jira issue" was *rejected* by <@U2>.',
+		toolResultText: 'The executor call "Create Jira issue" was rejected by <@U2>.',
+		toolResultIsError: true,
 	};
 
 	await continueResolvedApproval(runner as never, fakeCtx as never, fakeStore, approved);
 	await continueResolvedApproval(runner as never, fakeCtx as never, fakeStore, rejected);
 
 	assert.strictEqual(calls.length, 2);
-	assert.match(calls[0], /approved/);
-	assert.match(calls[1], /rejected/);
+	assert.strictEqual(calls[0]?.approved, true);
+	assert.match(calls[0]?.text ?? "", /Issue created/);
+	assert.strictEqual(calls[1]?.approved, false);
+	assert.match(calls[1]?.text ?? "", /rejected/);
 });
 
 // ============================================================================

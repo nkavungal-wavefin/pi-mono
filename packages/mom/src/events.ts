@@ -2,6 +2,7 @@ import { Cron } from "croner";
 import { existsSync, type FSWatcher, mkdirSync, readdirSync, statSync, unlinkSync, watch } from "fs";
 import { readFile } from "fs/promises";
 import { join } from "path";
+import { buildConversationId, parseConversationId } from "./conversations.js";
 import * as log from "./log.js";
 import type { SlackBot, SlackEvent } from "./slack.js";
 
@@ -315,7 +316,7 @@ export class EventsWatcher {
 		}
 	}
 
-	private execute(filename: string, event: MomEvent, deleteAfter: boolean = true): void {
+	private async execute(filename: string, event: MomEvent, deleteAfter: boolean = true): Promise<void> {
 		// Format the message
 		let scheduleInfo: string;
 		switch (event.type) {
@@ -331,14 +332,29 @@ export class EventsWatcher {
 		}
 
 		const message = `[EVENT:${filename}:${event.type}:${scheduleInfo}] ${event.text}`;
+		const target = parseConversationId(event.channelId);
+		let conversation = target;
+
+		if (!target.isDm) {
+			const anchorText = `_Scheduled workflow started: ${filename}_`;
+			const anchorTs = await this.slack.postMessage(target.slackChannelId, anchorText);
+			conversation = {
+				conversationId: buildConversationId(target.slackChannelId, anchorTs),
+				slackChannelId: target.slackChannelId,
+				threadTs: anchorTs,
+				isDm: false,
+			};
+		}
 
 		// Create synthetic SlackEvent
 		const syntheticEvent: SlackEvent = {
 			type: "mention",
-			channel: event.channelId,
+			conversationId: conversation.conversationId,
+			channel: conversation.slackChannelId,
 			user: "EVENT",
 			text: message,
 			ts: Date.now().toString(),
+			threadTs: conversation.threadTs,
 		};
 
 		// Enqueue for processing
