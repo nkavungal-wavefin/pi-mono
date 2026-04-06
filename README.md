@@ -29,6 +29,18 @@ OSS weekend runs Friday, March 27, 2026 through Monday, April 6, 2026. New issue
 
 Tools for building AI agents and managing LLM deployments.
 
+## Getting Started
+
+```bash
+git clone https://github.com/badlogic/pi-mono.git
+cd pi-mono
+npm install   # Install all dependencies
+npm run build # Build all packages
+./pi-test.sh  # Run the pi coding agent from sources
+```
+
+That's it! Check out the [packages/coding-agent](packages/coding-agent) docs for more details on using the coding agent.
+
 ## Packages
 
 | Package | Description |
