@@ -41,6 +41,25 @@ Tools for building AI agents and managing LLM deployments.
 | **[@mariozechner/pi-web-ui](packages/web-ui)** | Web components for AI chat interfaces |
 | **[@mariozechner/pi-pods](packages/pods)** | CLI for managing vLLM deployments on GPU pods |
 
+## Getting Started
+
+1. **Install dependencies**
+   ```bash
+   npm install
+   ```
+
+2. **Build all packages**
+   ```bash
+   npm run build
+   ```
+
+3. **Run the coding agent**
+   ```bash
+   ./pi-test.sh
+   ```
+
+For detailed usage, see **[packages/coding-agent](packages/coding-agent)**.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).
